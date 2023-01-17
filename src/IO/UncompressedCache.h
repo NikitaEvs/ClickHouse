@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Common/UnifiedCache.h"
 #include <Common/SipHash.h>
 #include <Common/ProfileEvents.h>
 #include <Common/HashTable/Hash.h>
@@ -20,7 +21,7 @@ namespace DB
 
 struct UncompressedCacheCell
 {
-    Memory<> data;
+    Memory<BuddyAllocator> data;
     size_t compressed_size;
     UInt32 additional_bytes;
 };

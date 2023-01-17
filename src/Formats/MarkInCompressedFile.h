@@ -4,6 +4,7 @@
 
 #include <base/types.h>
 #include <IO/WriteHelpers.h>
+#include "Common/UnifiedCache.h"
 #include <Common/PODArray.h>
 
 
@@ -40,7 +41,7 @@ struct MarkInCompressedFile
 
 };
 
-class MarksInCompressedFile : public PODArray<MarkInCompressedFile>
+class MarksInCompressedFile : public PODArray<MarkInCompressedFile, 4096, BuddyAllocator>
 {
 public:
     explicit MarksInCompressedFile(size_t n) : PODArray(n) {}
