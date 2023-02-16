@@ -57,7 +57,7 @@ public:
             using SLRUPolicy = SLRUCachePolicy<TKey, TMapped, HashFunction, WeightFunction>;
             cache_policy = std::make_unique<SLRUPolicy>(max_size, max_elements_size, size_ratio, on_weight_loss_function);
         }
-        else if (cache_policy_name == "UNIFIED")
+        else if (cache_policy_name == "unified")
         {
             using UnifiedPolicy = LRUUnifiedCachePolicy<TKey, TMapped, HashFunction, WeightFunction>;
             cache_policy = std::make_unique<UnifiedPolicy>(max_size, max_elements_size, on_weight_loss_function);
