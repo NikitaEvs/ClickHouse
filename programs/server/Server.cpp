@@ -656,7 +656,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     StackTrace::setShowAddresses(config().getBool("show_addresses_in_stack_traces", true));
 
-    const size_t buddy_arena_size = 2048 * (1ull << 20); // 2024 MB 
+    const size_t buddy_arena_size = 10_GiB;
     const size_t buddy_minimal_block_size = 16;
     auto& buddy_instance = DB::BuddyArena::instance();
     buddy_instance.initialize(buddy_minimal_block_size, buddy_arena_size);
@@ -1402,14 +1402,18 @@ int Server::main(const std::vector<std::string> & /*args*/)
     /// Set up caches.
 
     auto& global_cache_instance = LRUUnifiedCacheGlobal<UInt128, UInt128TrivialHash>::instance();
-    global_cache_instance.initialize(buddy_arena_size);
+    const double free_ram_ratio_to_start_cache_eviction = 0.3;
+    const double ram_ratio_for_cache_eviction_amount = 0.1;
+    global_cache_instance.initialize(static_cast<size_t>(buddy_arena_size * 0.5), 
+                                    free_ram_ratio_to_start_cache_eviction, 
+                                    ram_ratio_for_cache_eviction_amount);
 
     /// Lower cache size on low-memory systems.
     double cache_size_to_ram_max_ratio = config().getDouble("cache_size_to_ram_max_ratio", 0.5);
     size_t max_cache_size = static_cast<size_t>(memory_amount * cache_size_to_ram_max_ratio);
 
     /// Size of cache for uncompressed blocks. Zero means disabled.
-    String uncompressed_cache_policy = config().getString("uncompressed_cache_policy", "UNIFIED");
+    String uncompressed_cache_policy = config().getString("uncompressed_cache_policy", "unified");
     LOG_INFO(log, "Uncompressed cache policy name {}", uncompressed_cache_policy);
     size_t uncompressed_cache_size = config().getUInt64("uncompressed_cache_size", 0);
     if (uncompressed_cache_size > max_cache_size)
@@ -1436,7 +1440,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     /// Size of cache for marks (index of MergeTree family of tables).
     size_t mark_cache_size = config().getUInt64("mark_cache_size", 5368709120);
-    String mark_cache_policy = config().getString("mark_cache_policy", "UNIFIED");
+    String mark_cache_policy = config().getString("mark_cache_policy", "unified");
     if (!mark_cache_size)
         LOG_ERROR(log, "Too low mark cache size will lead to severe performance degradation.");
     if (mark_cache_size > max_cache_size)
