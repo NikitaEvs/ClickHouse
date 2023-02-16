@@ -171,7 +171,7 @@ public:
             printMemoryUsageDummy();
         }
 
-        CurrentMemoryTracker::alloc(size);
+        // CurrentMemoryTracker::alloc(size);
 
         return block->data;
     }
@@ -192,7 +192,7 @@ public:
         if (free_min_blocks % 10000 == 0) {
             printMemoryUsageDummy();
         }
-        CurrentMemoryTracker::free(freeing_memory);
+        // CurrentMemoryTracker::free(freeing_memory);
     }
 
     void free(void * buf) noexcept
@@ -209,7 +209,7 @@ public:
         if (free_min_blocks % 10000 == 0) {
             printMemoryUsageDummy();
         }
-        CurrentMemoryTracker::free(freeing_memory);
+        // CurrentMemoryTracker::free(freeing_memory);
     }
 
     [[nodiscard]] double getFreeSpaceRatio() const
@@ -252,7 +252,7 @@ private:
         /// TODO: Remove temporary hack to make the memory tracker works
         /// As we allocated the memory arena, we don't want to take it into account in the 
         /// memory tracker
-        CurrentMemoryTracker::free(size);
+        // CurrentMemoryTracker::free(size);
 
         return buffer;
     }
