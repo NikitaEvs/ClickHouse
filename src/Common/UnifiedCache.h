@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include <Poco/Logger.h>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
@@ -27,258 +29,6 @@ namespace ErrorCodes
     extern const int CANNOT_ALLOCATE_MEMORY;
     extern const int CANNOT_MUNMAP;
 }
-
-template <typename TKey, typename HashFunction = std::hash<TKey>>
-class LRUUnifiedCacheGlobal
-{
-public:
-    using Key = TKey;
-
-    static LRUUnifiedCacheGlobal & instance()
-    {
-        static LRUUnifiedCacheGlobal cache;
-        return cache;    
-    }
-
-    LRUUnifiedCacheGlobal() = default;
-
-    void initialize(size_t size)
-    {
-        max_size = size;
-    }
-
-    template <typename TMapped> 
-    std::shared_ptr<TMapped> get(const Key & key, std::lock_guard<std::mutex> & /* cache_lock */) 
-    {
-        std::lock_guard lock(mutex);
-
-        auto it = cells.find(key);
-        if (it == cells.end())
-        {
-            return std::shared_ptr<TMapped>();
-        }
-
-        Cell & cell = it->second;
-
-        /// Move the key to the end of the queue. The iterator remains valid.
-        queue.splice(queue.end(), queue, cell.queue_iterator);
-
-        return std::static_pointer_cast<TMapped>(cell.value);
-    }
-
-    void remove(const Key & key, std::lock_guard<std::mutex> & /* cache_lock */)
-    {
-        std::lock_guard lock(mutex);
-        removeLocked(key);
-    }
-
-    /// Similar to the remove function but performs deletions for all keys corresponding to the given type TMapped
-    template <typename TMapped>
-    void reset(std::lock_guard<std::mutex> & /* cache_lock */) 
-    {
-        std::lock_guard lock(mutex);
-
-        const std::type_index type_to_reset(typeid(TMapped));
-
-        std::vector<Key> keys_to_delete;
-        for (const auto & entry : cells) 
-        {
-            const auto & cell = entry.second;
-            if (cell.type == type_to_reset)
-                keys_to_delete.push_back(entry.first);
-        }
-
-        for (const auto & key : keys_to_delete) 
-            removeLocked(key);
-    }
-
-    template <typename TMapped>
-    void set(const Key & key, const std::shared_ptr<TMapped> & mapped, size_t weight, std::lock_guard<std::mutex> & /* cache_lock */)
-    {
-        {
-            std::lock_guard lock(mutex);
-        
-            auto [it, inserted] = cells.emplace(std::piecewise_construct,
-                std::forward_as_tuple(key),
-                std::forward_as_tuple(typeid(TMapped)));
-
-            Cell & cell = it->second;
-
-            if (inserted)
-            {
-                try
-                {
-                    cell.queue_iterator = queue.insert(queue.end(), key);
-                }
-                catch (...)
-                {
-                    cells.erase(it);
-                    throw;
-                }
-            }
-            else
-            {
-                current_size -= cell.size;
-                queue.splice(queue.end(), queue, cell.queue_iterator);
-            }
-
-            cell.value = std::static_pointer_cast<void>(mapped);
-            cell.size = cell.value ? weight : 0;
-            current_size += cell.size;
-        }
-
-        removeOverflow();
-    }
-
-    /// Evict entries using LRU strategy with approximate size = weight
-    size_t removeWeight(size_t weight)
-    {
-        std::lock_guard lock(mutex);
-
-        size_t current_weight_lost = 0;
-        while (current_size > 0 && current_weight_lost < weight)
-        {
-            const Key & key = queue.front();
-
-            auto it = cells.find(key);
-            if (it == cells.end())
-            {
-                LOG_ERROR(&Poco::Logger::get("UnifiedCache"), "LRUUnifiedCacheGlobal became inconsistent. There must be a bug in it.");
-                abort();
-            }
-
-            const auto & cell = it->second;
-
-            current_size -= cell.size;
-            current_weight_lost += cell.size;
-
-            cells.erase(it);
-            queue.pop_front();
-        }
-
-        return current_weight_lost;
-    }
-private:
-    using LRUQueue = std::list<Key>;
-    using LRUQueueIterator = typename LRUQueue::iterator;
-
-    LRUQueue queue;
-
-    struct Cell
-    {
-        std::shared_ptr<void> value = nullptr;
-        size_t size = 0;
-        std::type_index type; // is used in the reset funciton
-        LRUQueueIterator queue_iterator{};
-
-        explicit Cell(const std::type_info & type_info) : type(type_info) 
-        {}
-    };
-
-    using Cells = std::unordered_map<Key, Cell, HashFunction>;
-
-    Cells cells;
-
-    /// Total weight of values.
-    size_t current_size = 0;
-    size_t max_size = 0;
-
-    std::mutex mutex;
-
-    void removeOverflow()
-    {
-        if (current_size > max_size) 
-            removeWeight(current_size - max_size);
-    }
-
-    /// Remove entries with given key from the cells hashmap
-    /// Require lock on the mutex before calling
-    void removeLocked(const Key & key)
-    {
-        auto it = cells.find(key);
-        if (it == cells.end())
-            return;
-        auto & cell = it->second;
-        current_size -= cell.size;
-        queue.erase(cell.queue_iterator);
-        cells.erase(it);
-    }
-};
-
-
-/// Proxy-class - redirects all calls to the corresponding methods of the LRUUnifiedCacheGlobal global instance
-template <typename TKey, typename TMapped, typename HashFunction = std::hash<TKey>, typename WeightFunction = TrivialWeightFunction<TMapped>>
-class LRUUnifiedCachePolicy : public ICachePolicy<TKey, TMapped, HashFunction, WeightFunction>
-{
-public:
-    using Key = TKey;
-    using Mapped = TMapped;
-    using MappedPtr = std::shared_ptr<Mapped>;
-
-    using Base = ICachePolicy<TKey, TMapped, HashFunction, WeightFunction>;
-    using typename Base::OnWeightLossFunction;
-
-    using GlobalCachePolicy = LRUUnifiedCacheGlobal<TKey, HashFunction>;
-
-    /** Initialize LRUCachePolicy with max_size and max_elements_size.
-      * max_elements_size == 0 means no elements size restrictions.
-      */
-    explicit LRUUnifiedCachePolicy(size_t max_size_, size_t max_elements_size_ = 0, OnWeightLossFunction on_weight_loss_function_ = {})
-        : max_size(std::max(static_cast<size_t>(1), max_size_))
-        , max_elements_size(max_elements_size_)
-        , instance(GlobalCachePolicy::instance())
-    {
-        Base::on_weight_loss_function = on_weight_loss_function_;
-    }
-
-    size_t weight(std::lock_guard<std::mutex> & /* cache_lock */) const override
-    {
-        return current_size;
-    }
-
-    size_t count(std::lock_guard<std::mutex> & /* cache_lock */) const override
-    {
-        return number_of_elements;
-    }
-
-    size_t maxSize() const override
-    {
-        return max_size;
-    }
-
-    void reset(std::lock_guard<std::mutex> & cache_lock) override
-    {
-        instance.template reset<Mapped>(cache_lock);
-    }
-
-    void remove(const Key & key, std::lock_guard<std::mutex> & cache_lock) override
-    {
-        instance.remove(key, cache_lock);
-    }
-
-    MappedPtr get(const Key & key, std::lock_guard<std::mutex> & cache_lock) override
-    {
-        return instance.template get<Mapped>(key, cache_lock);
-    }
-
-    void set(const Key & key, const MappedPtr & mapped, std::lock_guard<std::mutex> & cache_lock) override
-    {
-        size_t weight = weight_function(*mapped);
-        instance.template set<Mapped>(key, mapped, weight, cache_lock);
-    }
-
-protected:
-    // Total weight of values.
-    // Not used for now, as we have a simple global cache policy
-    size_t current_size = 0;
-    size_t number_of_elements = 0;
-
-    const size_t max_size;
-    const size_t max_elements_size;
-
-    WeightFunction weight_function;
-    GlobalCachePolicy & instance;
-};
 
 /// Global memory arena under buddy allocator schema
 class BuddyArena
@@ -309,7 +59,9 @@ public:
 
     ~BuddyArena() noexcept
     {
-        deallocateArena(arena_buffer, total_size_bytes);
+        if (isValid())
+            // Do not throw exceptions from invalid munmap
+            munmap(arena_buffer, total_size_bytes);
     }
 
     BuddyArena(const BuddyArena&) = delete;
@@ -323,7 +75,7 @@ public:
     }
 
     /// Check that the ptr is contained in the allocated memory arena
-    bool containsPtr(const void * ptr) const 
+    bool isAllocated(const void * ptr) const 
     {
         const auto * arena_end = reinterpret_cast<char *>(arena_buffer) + total_size_bytes;
         return ptr >= arena_buffer && ptr < reinterpret_cast<const void *>(arena_end); 
@@ -331,12 +83,22 @@ public:
 
     void initialize(size_t minimal_allocation_size, size_t size)
     {
+        /// We will divide the whole size bytes on blocks with size == minimal_allocation_size
+        assert(size % minimal_allocation_size == 0);
+
         total_size_bytes = size;
         number_of_levels = 1;
         minimal_allocation_size_bytes = minimal_allocation_size;
 
         /// Calculate number of levels
         size_t number_of_blocks_on_level = size / minimal_allocation_size; 
+
+        /// Number of blocks on the level could not be the power of 2
+        /// In this case we intentionally add one level to the binary tree so we'll have enough 
+        /// leaves to store all minimal blocks
+        if (number_of_blocks_on_level > 1 && number_of_blocks_on_level % 2 != 0) 
+            ++number_of_levels;
+
         while (number_of_blocks_on_level > 1) 
         {
             number_of_blocks_on_level >>= 1;
@@ -366,7 +128,12 @@ public:
         }
 
         /// Deallocate minimal blocks to fill the space between the meta storage and the size that is
-        /// the nearest power of 2
+        /// the nearest power of 2, so after it we can deallocate blocks with an exponential increasing sizes 
+        /// Arena buffer:
+        /// [*******-------------|------------------------------------]
+        ///  |               |   |
+        ///  ^ meta storage  |   ^ meta_storage_size_round_up_to_power_of_2
+        ///                  ^ deallocate these blocks on this step
         const auto * minimal_blocks_area_end = reinterpret_cast<char *>(arena_buffer) + meta_storage_size_round_up_to_power_of_2 * minimal_allocation_size_bytes;
         while (current_storage_ptr != minimal_blocks_area_end) 
         {
@@ -374,7 +141,7 @@ public:
             current_storage_ptr += minimal_allocation_size_bytes;
         }
 
-        /// Deallocate next blocks with increasing sizes
+        /// Deallocate all next blocks after meta_storage_size_round_up_to_power_of_2 with increasing sizes 
         size_t current_block_size_bytes = meta_storage_size_round_up_to_power_of_2 * minimal_allocation_size;
         size_t current_block_level = calculateLevel(current_block_size_bytes);
         while (current_block_level > 0) 
@@ -386,24 +153,10 @@ public:
         }
     }
 
-    void * allocate(size_t size)
-    {
-        auto level = calculateLevel(size);
-
-        std::lock_guard lock(mutex);
-        auto * block = allocateBlock(level);
-        setPointerLevel(block, level);
-
-        /// TODO: Remove temp local dummy memory tracker
-        free_min_blocks -= (1ull << ((number_of_levels - level) - 1));
-
-        return block->data;
-    }
-
-    void * allocate(size_t size, size_t align) 
+    void * malloc(size_t size, size_t align = 0) 
     {
         /// TODO: Add assertion
-        /// assert that it is a power of 2 and a multiple of sizeof(void*) 
+        /// assert that align is a power of 2 and a multiple of sizeof(void*) 
         /// https://en.cppreference.com/w/cpp/memory/c/aligned_alloc
 
         auto level = calculateLevel(size, align);
@@ -413,12 +166,19 @@ public:
         setPointerLevel(block, level);
 
         /// TODO: Remove temp local dummy memory tracker
-        free_min_blocks -= (1ull << ((number_of_levels - level) - 1));
+        free_min_blocks.fetch_sub(1ull << ((number_of_levels - level) - 1));
+        if (free_min_blocks % 10000 == 0) {
+            printMemoryUsageDummy();
+        }
+
+        CurrentMemoryTracker::alloc(size);
 
         return block->data;
     }
 
-    void deallocate(void * buf, size_t size) noexcept
+    /// TODO: Probably remove this function, code duplication
+    /// This function could be implemented faster than free(void *) but the optimization can be minor
+    void free(void * buf, size_t size) noexcept
     {
         auto * block = reinterpret_cast<MemoryBlock *>(buf);
         auto level = calculateLevel(size);
@@ -426,10 +186,16 @@ public:
         std::lock_guard lock(mutex);
         deallocateBlock(block, level);
 
-        free_min_blocks += (1ull << ((number_of_levels - level) - 1));
+        /// TODO: Remove temp local dummy memory tracker
+        const size_t freeing_memory = 1ull << ((number_of_levels - level) - 1);
+        free_min_blocks.fetch_add(freeing_memory);
+        if (free_min_blocks % 10000 == 0) {
+            printMemoryUsageDummy();
+        }
+        CurrentMemoryTracker::free(freeing_memory);
     }
 
-    void deallocate(void * buf) noexcept
+    void free(void * buf) noexcept
     {
         auto * block = reinterpret_cast<MemoryBlock *>(buf);
         auto level = getPointerLevel(block);
@@ -437,7 +203,25 @@ public:
         std::lock_guard lock(mutex);
         deallocateBlock(block, level);
 
-        free_min_blocks += (1ull << ((number_of_levels - level) - 1));
+        /// TODO: Remove temp local dummy memory tracker
+        const size_t freeing_memory = 1ull << ((number_of_levels - level) - 1);
+        free_min_blocks.fetch_add(freeing_memory);
+        if (free_min_blocks % 10000 == 0) {
+            printMemoryUsageDummy();
+        }
+        CurrentMemoryTracker::free(freeing_memory);
+    }
+
+    [[nodiscard]] double getFreeSpaceRatio() const
+    {
+        /// TODO: Change seq_cst memory_order on the free_min_blocks atomic
+        auto occupied_blocks = min_blocks_num - free_min_blocks.load();
+        return static_cast<double>(occupied_blocks) / min_blocks_num * 100.0;
+    }
+
+    [[nodiscard]] size_t getTotalSizeBytes() const
+    {
+        return total_size_bytes;
     }
 
 private:
@@ -448,11 +232,12 @@ private:
 
     size_t minimal_allocation_size_bytes = 0;
 
-    size_t free_min_blocks = 0;
+    std::atomic<size_t> free_min_blocks = 0;
     size_t min_blocks_num = 0;
 
     std::mutex mutex;
 
+    /// Meta storage 
     bool * block_status;
     uint8_t * pointers_levels;
     MemoryBlock ** free_lists;
@@ -464,26 +249,17 @@ private:
         if (MAP_FAILED == buffer)
             DB::throwFromErrno(fmt::format("BuddyArena: Cannot mmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
 
+        /// TODO: Remove temporary hack to make the memory tracker works
+        /// As we allocated the memory arena, we don't want to take it into account in the 
+        /// memory tracker
+        CurrentMemoryTracker::free(size);
+
         return buffer;
     }
 
     static void deallocateArena(void * buffer, size_t size) 
     {
-        if (0 != munmap(buffer, size))
-            DB::throwFromErrno(fmt::format("Allocator: Cannot munmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_MUNMAP);
-    }
-
-    void * allocateImpl(size_t level) 
-    {
-        std::lock_guard lock(mutex);
-        auto * block = allocateBlock(level);
-        setPointerLevel(block, level);
-
-        /// TODO: Remove temporarly internal dummy memory tracker after integration with global
-        /// memory tracker
-        free_min_blocks -= (1ull << ((number_of_levels - level) - 1));
-
-        return block->data;
+        munmap(buffer, size);
     }
 
     size_t calculateLevel(size_t size) const 
@@ -496,7 +272,7 @@ private:
         {
             // Low in memory
             if (current_level == 0) 
-                DB::throwFromErrno(fmt::format("BuddyArena: Cannot allocate enough memory {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+                DB::throwFromErrno(fmt::format("BuddyArena: Cannot find level for size {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
 
             --current_level;
             current_block_size *= 2;
@@ -516,7 +292,7 @@ private:
 
     size_t calculateBlockSizeOnLevel(size_t level) const 
     {
-        return total_size_bytes / (1u << level);
+        return minimal_allocation_size_bytes * (1ull << ((number_of_levels - level) - 1));
     }
 
     size_t calculateIndexInLevel(const MemoryBlock * block, size_t level) const 
@@ -546,6 +322,7 @@ private:
     }
 
     /// Calculate number of minimal blocks for the allocation on the lower level
+    /// Used to calculate offset for the meta storage beforehand
     size_t calculateMinBlocksNumber(size_t size_bytes) const
     {
         return size_bytes / minimal_allocation_size_bytes + (size_bytes % minimal_allocation_size_bytes == 0 ? 0 : 1);
@@ -577,7 +354,7 @@ private:
 
         // Already on the top
         if (level == 0) 
-            DB::throwFromErrno(fmt::format("BuddyArena: Cannot allocate enough memory."), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+            throw std::bad_alloc();
 
         auto * bigger_block = allocateBlock(level - 1);
         auto [block, buddy_block] = divideBlock(bigger_block, level - 1);
@@ -736,6 +513,288 @@ private:
     }
 };
 
+template <typename TKey, typename HashFunction = std::hash<TKey>>
+class LRUUnifiedCacheGlobal
+{
+public:
+    using Key = TKey;
+
+    static LRUUnifiedCacheGlobal & instance()
+    {
+        static LRUUnifiedCacheGlobal cache;
+        return cache;    
+    }
+
+    LRUUnifiedCacheGlobal() = default;
+
+    void initialize(size_t max_size_)
+    {
+        max_size = max_size_;
+        is_cache_evictions_on_low_memory_enabled = false;
+    }
+
+    void initialize(size_t max_size_, 
+                    double free_ram_ratio_to_start_cache_eviction_, 
+                    double ram_ratio_for_cache_eviciton_amount_) 
+    {
+        max_size = max_size_;
+        free_ram_ratio_to_start_cache_eviction = free_ram_ratio_to_start_cache_eviction_;
+        ram_ratio_for_cache_eviciton_amount = ram_ratio_for_cache_eviciton_amount_;
+        is_cache_evictions_on_low_memory_enabled = true;
+    }
+
+    template <typename TMapped> 
+    std::shared_ptr<TMapped> get(const Key & key, std::lock_guard<std::mutex> & /* cache_lock */) 
+    {
+        std::lock_guard lock(mutex);
+
+        auto it = cells.find(key);
+        if (it == cells.end())
+        {
+            return std::shared_ptr<TMapped>();
+        }
+
+        Cell & cell = it->second;
+
+        /// Move the key to the end of the queue. The iterator remains valid.
+        queue.splice(queue.end(), queue, cell.queue_iterator);
+
+        return std::static_pointer_cast<TMapped>(cell.value);
+    }
+
+    void remove(const Key & key, std::lock_guard<std::mutex> & /* cache_lock */)
+    {
+        std::lock_guard lock(mutex);
+        removeLocked(key);
+    }
+
+    /// Similar to the remove function but performs deletions for all keys corresponding to the given type TMapped
+    template <typename TMapped>
+    void reset(std::lock_guard<std::mutex> & /* cache_lock */) 
+    {
+        std::lock_guard lock(mutex);
+
+        const std::type_index type_to_reset(typeid(TMapped));
+
+        std::vector<Key> keys_to_delete;
+        for (const auto & entry : cells) 
+        {
+            const auto & cell = entry.second;
+            if (cell.type == type_to_reset)
+                keys_to_delete.push_back(entry.first);
+        }
+
+        for (const auto & key : keys_to_delete) 
+            removeLocked(key);
+    }
+
+    template <typename TMapped>
+    void set(const Key & key, const std::shared_ptr<TMapped> & mapped, size_t weight, std::lock_guard<std::mutex> & /* cache_lock */)
+    {
+        std::lock_guard lock(mutex);
+        
+        auto [it, inserted] = cells.emplace(std::piecewise_construct,
+            std::forward_as_tuple(key),
+            std::forward_as_tuple(typeid(TMapped)));
+
+        Cell & cell = it->second;
+
+        if (inserted)
+        {
+            try
+            {
+                cell.queue_iterator = queue.insert(queue.end(), key);
+            }
+            catch (...)
+            {
+                cells.erase(it);
+                throw;
+            }
+        }
+        else
+        {
+            current_size -= cell.size;
+            queue.splice(queue.end(), queue, cell.queue_iterator);
+        }
+
+        cell.value = std::static_pointer_cast<void>(mapped);
+        cell.size = cell.value ? weight : 0;
+        current_size += cell.size;
+
+        removeOverflowLocked();
+    }
+
+    /// Evict entries using LRU strategy with approximate size = weight
+    size_t removeWeight(size_t weight)
+    {
+        std::lock_guard lock(mutex);
+        return removeWeightLocked(weight);
+    }
+private:
+    using LRUQueue = std::list<Key>;
+    using LRUQueueIterator = typename LRUQueue::iterator;
+
+    LRUQueue queue;
+
+    struct Cell
+    {
+        std::shared_ptr<void> value = nullptr;
+        size_t size = 0;
+        std::type_index type; // is used in the reset funciton
+        LRUQueueIterator queue_iterator{};
+
+        explicit Cell(const std::type_info & type_info) : type(type_info) 
+        {}
+    };
+
+    using Cells = std::unordered_map<Key, Cell, HashFunction>;
+
+    Cells cells;
+
+    /// Total weight of values.
+    size_t current_size = 0;
+    size_t max_size = 0;
+
+    bool is_cache_evictions_on_low_memory_enabled = false;
+    double free_ram_ratio_to_start_cache_eviction = 0.0;
+    double ram_ratio_for_cache_eviciton_amount = 0.0;
+
+    std::mutex mutex;
+
+    /// Remove entries with given key from the cells hashmap
+    /// Require lock on the mutex before calling
+    void removeLocked(const Key & key)
+    {
+        auto it = cells.find(key);
+        if (it == cells.end())
+            return;
+        auto & cell = it->second;
+        current_size -= cell.size;
+        queue.erase(cell.queue_iterator);
+        cells.erase(it);
+    }
+
+    void removeOverflowLocked()
+    {
+        /// Check local size setting 
+        if (max_size != 0 && current_size > max_size) 
+            removeWeightLocked(current_size - max_size);
+
+        /// Ask global allocator for free space ratio
+        auto & allocator_instance = BuddyArena::instance();
+        auto free_space_ratio = allocator_instance.getFreeSpaceRatio();
+        if (is_cache_evictions_on_low_memory_enabled && free_space_ratio < free_ram_ratio_to_start_cache_eviction) 
+        {
+            size_t weight_to_evict = static_cast<size_t>(allocator_instance.getTotalSizeBytes() * ram_ratio_for_cache_eviciton_amount);
+            removeWeightLocked(weight_to_evict);
+        }
+    }
+
+    size_t removeWeightLocked(size_t weight) 
+    {
+        LOG_DEBUG(&Poco::Logger::get("UnifiedCache"), "LRUUnifiedCacheGlobal: remove weight {}", ReadableSize(weight));
+
+        size_t current_weight_lost = 0;
+        while (current_size > 0 && current_weight_lost < weight)
+        {
+            const Key & key = queue.front();
+
+            auto it = cells.find(key);
+            if (it == cells.end())
+            {
+                LOG_ERROR(&Poco::Logger::get("UnifiedCache"), "LRUUnifiedCacheGlobal became inconsistent. There must be a bug in it.");
+                abort();
+            }
+
+            const auto & cell = it->second;
+
+            current_size -= cell.size;
+            current_weight_lost += cell.size;
+
+            cells.erase(it);
+            queue.pop_front();
+        }
+
+        return current_weight_lost;
+    }
+};
+
+
+/// Proxy-class - redirects all calls to the corresponding methods of the LRUUnifiedCacheGlobal global instance
+template <typename TKey, typename TMapped, typename HashFunction = std::hash<TKey>, typename WeightFunction = TrivialWeightFunction<TMapped>>
+class LRUUnifiedCachePolicy : public ICachePolicy<TKey, TMapped, HashFunction, WeightFunction>
+{
+public:
+    using Key = TKey;
+    using Mapped = TMapped;
+    using MappedPtr = std::shared_ptr<Mapped>;
+
+    using Base = ICachePolicy<TKey, TMapped, HashFunction, WeightFunction>;
+    using typename Base::OnWeightLossFunction;
+
+    using GlobalCachePolicy = LRUUnifiedCacheGlobal<TKey, HashFunction>;
+
+    /** Initialize LRUCachePolicy with max_size and max_elements_size.
+      * max_elements_size == 0 means no elements size restrictions.
+      */
+    explicit LRUUnifiedCachePolicy(size_t max_size_, size_t max_elements_size_ = 0, OnWeightLossFunction on_weight_loss_function_ = {})
+        : max_size(std::max(static_cast<size_t>(1), max_size_))
+        , max_elements_size(max_elements_size_)
+        , instance(GlobalCachePolicy::instance())
+    {
+        Base::on_weight_loss_function = on_weight_loss_function_;
+    }
+
+    size_t weight(std::lock_guard<std::mutex> & /* cache_lock */) const override
+    {
+        return current_size;
+    }
+
+    size_t count(std::lock_guard<std::mutex> & /* cache_lock */) const override
+    {
+        return number_of_elements;
+    }
+
+    size_t maxSize() const override
+    {
+        return max_size;
+    }
+
+    void reset(std::lock_guard<std::mutex> & cache_lock) override
+    {
+        instance.template reset<Mapped>(cache_lock);
+    }
+
+    void remove(const Key & key, std::lock_guard<std::mutex> & cache_lock) override
+    {
+        instance.remove(key, cache_lock);
+    }
+
+    MappedPtr get(const Key & key, std::lock_guard<std::mutex> & cache_lock) override
+    {
+        return instance.template get<Mapped>(key, cache_lock);
+    }
+
+    void set(const Key & key, const MappedPtr & mapped, std::lock_guard<std::mutex> & cache_lock) override
+    {
+        size_t weight = weight_function(*mapped);
+        instance.template set<Mapped>(key, mapped, weight, cache_lock);
+    }
+
+protected:
+    // Total weight of values.
+    // Not used for now, as we have a simple global cache policy
+    size_t current_size = 0;
+    size_t number_of_elements = 0;
+
+    const size_t max_size;
+    const size_t max_elements_size;
+
+    WeightFunction weight_function;
+    GlobalCachePolicy & instance;
+};
+
+
 class BuddyAllocator
 {
 public:
@@ -743,7 +802,7 @@ public:
     static void * alloc(size_t size, size_t alignment = 0)
     {
         checkSize(size);
-        CurrentMemoryTracker::alloc(size);
+        // CurrentMemoryTracker::alloc(size);
         return allocNoTrack(size, alignment);
     }
 
@@ -754,11 +813,11 @@ public:
         {
             checkSize(size);
             freeNoTrack(buf, size);
-            CurrentMemoryTracker::free(size);
+            // CurrentMemoryTracker::free(size);
         }
         catch (...)
         {
-            DB::tryLogCurrentException("Allocator::free");
+            DB::tryLogCurrentException("BuddyAllocator::free");
             throw;
         }
     }
@@ -786,8 +845,18 @@ public:
             buf = new_buf;
         }
 
+        // LOG_INFO(&Poco::Logger::get("UnifiedCache"), "BuddyAllocator: Reallocate buffer {} with old size {} and new size {} (do realloc)", buf, ReadableSize(old_size), ReadableSize(new_size));
+
         return buf;
     }
+
+protected:
+    static constexpr size_t getStackThreshold()
+    {
+        return 0;
+    }
+
+    static constexpr bool clear_memory = true;
 
 private:
     static void checkSize(size_t size)
@@ -797,14 +866,59 @@ private:
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Too large size ({}) passed to allocator. It indicates an error.", size);
     }
 
-    static void * allocNoTrack(size_t size, size_t /*alignment = 0*/) 
+    static void * allocNoTrack(size_t size, size_t alignment = 0) 
     {
-        return BuddyArena::instance().allocate(size);
+        auto & instance = BuddyArena::instance();
+        void * buf = nullptr;
+        if (instance.isValid()) 
+        {
+            buf = instance.malloc(size, alignment);
+
+            if (nullptr == buf)
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot allocate memory (BuddyArena) {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+
+            if constexpr (clear_memory)
+                memset(buf, 0, size);
+        }
+        /// TODO: Remove hardcoded constant, only for temporary tests of base Allocator replacement
+        // else if (alignment <= MALLOC_MIN_ALIGNMENT)
+        else if (alignment <= 8)
+        {
+            if constexpr (clear_memory)
+                buf = ::calloc(size, 1);
+            else
+                buf = ::malloc(size);
+
+            if (nullptr == buf)
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot malloc {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+        }
+        else
+        {
+            buf = nullptr;
+            int res = posix_memalign(&buf, alignment, size);
+
+            if (0 != res)
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot allocate memory (posix_memalign) {}.", ReadableSize(size)),
+                    DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, res);
+
+            if constexpr (clear_memory)
+                memset(buf, 0, size);
+        }
+
+        return buf;
     }
 
     static void freeNoTrack(void * buf, size_t size)
     {
-        BuddyArena::instance().deallocate(buf, size);
+        if (nullptr == buf) {
+            return;
+        }
+
+        auto & instance = BuddyArena::instance();
+        if (instance.isValid() && instance.isAllocated(buf)) 
+            instance.free(buf, size);
+        else
+            ::free(buf);
     }
 };
 
