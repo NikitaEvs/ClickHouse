@@ -5,6 +5,7 @@
 #include <vector>
 #include <boost/noncopyable.hpp>
 #include <Core/Defines.h>
+#include "Common/UnifiedCache.h"
 #if __has_include(<sanitizer/asan_interface.h>) && defined(ADDRESS_SANITIZER)
 #   include <sanitizer/asan_interface.h>
 #endif
@@ -38,7 +39,7 @@ private:
     static constexpr size_t pad_right = 15;
 
     /// Contiguous MemoryChunk of memory and pointer to free space inside it. Member of single-linked list.
-    struct alignas(16) MemoryChunk : private Allocator<false>    /// empty base optimization
+    struct alignas(16) MemoryChunk : private BuddyAllocator    /// empty base optimization
     {
         char * begin;
         char * pos;
@@ -51,7 +52,7 @@ private:
             ProfileEvents::increment(ProfileEvents::ArenaAllocChunks);
             ProfileEvents::increment(ProfileEvents::ArenaAllocBytes, size_);
 
-            begin = reinterpret_cast<char *>(Allocator<false>::alloc(size_));
+            begin = reinterpret_cast<char *>(BuddyAllocator::alloc(size_));
             pos = begin;
             end = begin + size_ - pad_right;
             prev = prev_;
@@ -67,7 +68,7 @@ private:
             /// asan, it will correctly poison the memory by itself.
             ASAN_UNPOISON_MEMORY_REGION(begin, size());
 
-            Allocator<false>::free(begin, size());
+            BuddyAllocator::free(begin, size());
 
             delete prev;
         }

@@ -37,14 +37,14 @@ inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
     if constexpr (sizeof...(TAlign) == 1)
     {
         if (instance.isValid())
-            ptr = instance.allocate(size, alignToSizeT(align...));
+            ptr = instance.malloc(size, alignToSizeT(align...));
         else
             ptr = aligned_alloc(alignToSizeT(align...), size);
     } 
     else
     {
         if (instance.isValid())
-            ptr = instance.allocate(size);
+            ptr = instance.malloc(size);
         else
             ptr = malloc(size);
     }
@@ -60,7 +60,7 @@ inline ALWAYS_INLINE void * newNoExept(std::size_t size) noexcept
 {
     auto & instance = DB::BuddyArena::instance();
     if (instance.isValid())
-        return instance.allocate(size);
+        return instance.malloc(size);
     else
         return malloc(size);
 }
@@ -69,7 +69,7 @@ inline ALWAYS_INLINE void * newNoExept(std::size_t size, std::align_val_t align)
 {
     auto & instance = DB::BuddyArena::instance();
     if (instance.isValid())
-        return instance.allocate(size, static_cast<size_t>(align));
+        return instance.malloc(size, static_cast<size_t>(align));
     else 
         return aligned_alloc(static_cast<size_t>(align), size);
 }
@@ -77,8 +77,8 @@ inline ALWAYS_INLINE void * newNoExept(std::size_t size, std::align_val_t align)
 inline ALWAYS_INLINE void deleteImpl(void * ptr) noexcept
 {
     auto & instance = DB::BuddyArena::instance();
-    if (instance.isValid() && instance.containsPtr(ptr))
-        instance.deallocate(ptr);
+    if (instance.isValid() && instance.isAllocated(ptr))
+        instance.free(ptr);
     else
         free(ptr);
 }
@@ -93,9 +93,9 @@ inline ALWAYS_INLINE void deleteSized(void * ptr, std::size_t size, TAlign... al
         return;
 
     auto & instance = DB::BuddyArena::instance();
-    if (instance.isValid() && instance.containsPtr(ptr)) 
+    if (instance.isValid() && instance.isAllocated(ptr)) 
     {
-        instance.deallocate(ptr);
+        instance.free(ptr);
     }
     else 
     {
@@ -158,7 +158,7 @@ requires DB::OptionalArgument<TAlign...>
 inline ALWAYS_INLINE void untrackMemory(void * ptr [[maybe_unused]], std::size_t size [[maybe_unused]] = 0, TAlign... align [[maybe_unused]]) noexcept
 {
     auto & instance = DB::BuddyArena::instance();
-    if (instance.isValid() && instance.containsPtr(ptr))  {
+    if (instance.isValid() && instance.isAllocated(ptr))  {
         CurrentMemoryTracker::free(size);
         return;
     }
