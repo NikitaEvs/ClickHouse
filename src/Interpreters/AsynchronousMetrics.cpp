@@ -6,6 +6,8 @@
 #include <Interpreters/Context.h>
 #include <Coordination/Keeper4LWInfo.h>
 #include <Coordination/KeeperDispatcher.h>
+#include "Common/HashTable/Hash.h"
+#include "Common/UnifiedCache.h"
 #include <Common/Exception.h>
 #include <Common/setThreadName.h>
 #include <Common/CurrentMetrics.h>
@@ -617,6 +619,21 @@ void AsynchronousMetrics::update(TimePoint update_time)
         {
             new_values["FilesystemCacheBytes"] = cache_data->cache->getUsedCacheSize();
             new_values["FilesystemCacheFiles"] = cache_data->cache->getFileSegmentsNum();
+        }
+    }
+
+    {
+        auto & unified_cache= LRUUnifiedCacheGlobal<UInt128, UInt128TrivialHash>::instance();
+        if (unified_cache.isValid())
+        {
+            const auto unified_cache_weight = unified_cache.getCacheWeight();
+            const auto unified_cache_count = unified_cache.getCacheCount();
+            new_values["UnifiedCacheBytes"] = unified_cache_weight;
+            new_values["UnifiedCacheCount"] = unified_cache_count;
+            LOG_TRACE(log,
+                "UnifiedCacheTracking: weight is {}, count is {}",
+                ReadableSize(unified_cache_weight),
+                unified_cache_count);
         }
     }
 
