@@ -160,17 +160,14 @@ public:
         /// assert that align is a power of 2 and a multiple of sizeof(void*) 
         /// https://en.cppreference.com/w/cpp/memory/c/aligned_alloc
 
-
         auto level = calculateLevel(size, align);
-        const size_t allocated_memory_blocks = 1ull << ((number_of_levels - level) - 1);
-
-        // CurrentMemoryTracker::allocNoThrow(allocated_memory_blocks * minimal_allocation_size_bytes);
 
         std::lock_guard lock(mutex);
         auto * block = allocateBlock(level);
         setPointerLevel(block, level);
 
         /// TODO: Remove temp local dummy memory tracker
+        const size_t allocated_memory_blocks = 1ull << ((number_of_levels - level) - 1);
         free_min_blocks.fetch_sub(allocated_memory_blocks);
         // if (free_min_blocks % 10000 == 0) {
         //     printMemoryUsageDummy();
@@ -195,8 +192,6 @@ public:
         // if (free_min_blocks % 10000 == 0) {
         //     printMemoryUsageDummy();
         // }
-
-        // CurrentMemoryTracker::free(freeing_memory_blocks * minimal_allocation_size_bytes);
     }
 
     void free(void * buf) noexcept
@@ -213,8 +208,6 @@ public:
         // if (free_min_blocks % 10000 == 0) {
         //     printMemoryUsageDummy();
         // }
-
-        // CurrentMemoryTracker::free(freeing_memory_blocks * minimal_allocation_size_bytes);
     }
 
     [[nodiscard]] double getFreeSpaceRatio() const
