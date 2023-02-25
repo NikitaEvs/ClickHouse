@@ -13,6 +13,7 @@
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
+#include <unistd.h>
 
 #include <Common/HashTable/Hash.h>
 #include <Common/ICachePolicy.h>
@@ -159,19 +160,21 @@ public:
         /// assert that align is a power of 2 and a multiple of sizeof(void*) 
         /// https://en.cppreference.com/w/cpp/memory/c/aligned_alloc
 
+
         auto level = calculateLevel(size, align);
+        const size_t allocated_memory_blocks = 1ull << ((number_of_levels - level) - 1);
+
+        // CurrentMemoryTracker::allocNoThrow(allocated_memory_blocks * minimal_allocation_size_bytes);
 
         std::lock_guard lock(mutex);
         auto * block = allocateBlock(level);
         setPointerLevel(block, level);
 
         /// TODO: Remove temp local dummy memory tracker
-        free_min_blocks.fetch_sub(1ull << ((number_of_levels - level) - 1));
-        if (free_min_blocks % 10000 == 0) {
-            printMemoryUsageDummy();
-        }
-
-        // CurrentMemoryTracker::alloc(size);
+        free_min_blocks.fetch_sub(allocated_memory_blocks);
+        // if (free_min_blocks % 10000 == 0) {
+        //     printMemoryUsageDummy();
+        // }
 
         return block->data;
     }
@@ -187,12 +190,13 @@ public:
         deallocateBlock(block, level);
 
         /// TODO: Remove temp local dummy memory tracker
-        const size_t freeing_memory = 1ull << ((number_of_levels - level) - 1);
-        free_min_blocks.fetch_add(freeing_memory);
-        if (free_min_blocks % 10000 == 0) {
-            printMemoryUsageDummy();
-        }
-        // CurrentMemoryTracker::free(freeing_memory);
+        const size_t freeing_memory_blocks = 1ull << ((number_of_levels - level) - 1);
+        free_min_blocks.fetch_add(freeing_memory_blocks);
+        // if (free_min_blocks % 10000 == 0) {
+        //     printMemoryUsageDummy();
+        // }
+
+        // CurrentMemoryTracker::free(freeing_memory_blocks * minimal_allocation_size_bytes);
     }
 
     void free(void * buf) noexcept
@@ -204,19 +208,20 @@ public:
         deallocateBlock(block, level);
 
         /// TODO: Remove temp local dummy memory tracker
-        const size_t freeing_memory = 1ull << ((number_of_levels - level) - 1);
-        free_min_blocks.fetch_add(freeing_memory);
-        if (free_min_blocks % 10000 == 0) {
-            printMemoryUsageDummy();
-        }
-        // CurrentMemoryTracker::free(freeing_memory);
+        const size_t freeing_memory_blocks = 1ull << ((number_of_levels - level) - 1);
+        free_min_blocks.fetch_add(freeing_memory_blocks);
+        // if (free_min_blocks % 10000 == 0) {
+        //     printMemoryUsageDummy();
+        // }
+
+        // CurrentMemoryTracker::free(freeing_memory_blocks * minimal_allocation_size_bytes);
     }
 
     [[nodiscard]] double getFreeSpaceRatio() const
     {
         /// TODO: Change seq_cst memory_order on the free_min_blocks atomic
         auto occupied_blocks = min_blocks_num - free_min_blocks.load();
-        return static_cast<double>(occupied_blocks) / min_blocks_num * 100.0;
+        return static_cast<double>(min_blocks_num - occupied_blocks) / min_blocks_num;
     }
 
     [[nodiscard]] size_t getTotalSizeBytes() const
@@ -543,6 +548,37 @@ public:
         is_cache_evictions_on_low_memory_enabled = true;
     }
 
+    [[nodiscard]] bool isValid() const
+    {
+        return max_size > 0;
+    }
+
+    [[nodiscard]] size_t getCacheWeight() const 
+    {
+        std::lock_guard lock(mutex);
+        return current_size;
+    }
+
+    [[nodiscard]] size_t getCacheCount() const
+    {
+        std::lock_guard lock(mutex);
+        return cells.size();
+    }
+
+    template <typename TMapped>
+    [[nodiscard]] size_t getCacheTypeWeight()
+    {
+        std::lock_guard lock(mutex);
+        return current_size_by_types[typeid(TMapped)];
+    }
+
+    template <typename TMapped>
+    [[nodiscard]] size_t getCacheTypeCount()
+    {
+        std::lock_guard lock(mutex);
+        return current_count_by_types[typeid(TMapped)];
+    }
+
     template <typename TMapped> 
     std::shared_ptr<TMapped> get(const Key & key, std::lock_guard<std::mutex> & /* cache_lock */) 
     {
@@ -614,12 +650,16 @@ public:
         else
         {
             current_size -= cell.size;
+            current_size_by_types[cell.type] -= cell.size;
+            --current_count_by_types[cell.type];
             queue.splice(queue.end(), queue, cell.queue_iterator);
         }
 
         cell.value = std::static_pointer_cast<void>(mapped);
         cell.size = cell.value ? weight : 0;
         current_size += cell.size;
+        current_size_by_types[cell.type] += cell.size;
+        ++current_count_by_types[cell.type];
 
         removeOverflowLocked();
     }
@@ -655,11 +695,15 @@ private:
     size_t current_size = 0;
     size_t max_size = 0;
 
+    std::unordered_map<std::type_index, size_t> current_size_by_types;
+    std::unordered_map<std::type_index, size_t> current_count_by_types;
+
+    /// Evictions on low memory policy
     bool is_cache_evictions_on_low_memory_enabled = false;
     double free_ram_ratio_to_start_cache_eviction = 0.0;
     double ram_ratio_for_cache_eviciton_amount = 0.0;
 
-    std::mutex mutex;
+    mutable std::mutex mutex;
 
     /// Remove entries with given key from the cells hashmap
     /// Require lock on the mutex before calling
@@ -670,6 +714,8 @@ private:
             return;
         auto & cell = it->second;
         current_size -= cell.size;
+        current_size_by_types[cell.type] -= cell.size;
+        --current_count_by_types[cell.type];
         queue.erase(cell.queue_iterator);
         cells.erase(it);
     }
@@ -709,6 +755,8 @@ private:
             const auto & cell = it->second;
 
             current_size -= cell.size;
+            current_size_by_types[cell.type] -= cell.size;
+            --current_count_by_types[cell.type];
             current_weight_lost += cell.size;
 
             cells.erase(it);
@@ -747,12 +795,12 @@ public:
 
     size_t weight(std::lock_guard<std::mutex> & /* cache_lock */) const override
     {
-        return current_size;
+        return instance.template getCacheTypeWeight<Mapped>();
     }
 
     size_t count(std::lock_guard<std::mutex> & /* cache_lock */) const override
     {
-        return number_of_elements;
+        return instance.template getCacheTypeCount<Mapped>();
     }
 
     size_t maxSize() const override
@@ -784,6 +832,7 @@ public:
 protected:
     // Total weight of values.
     // Not used for now, as we have a simple global cache policy
+    // TODO: Remove it
     size_t current_size = 0;
     size_t number_of_elements = 0;
 
