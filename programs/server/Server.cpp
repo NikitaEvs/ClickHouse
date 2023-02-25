@@ -656,7 +656,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     StackTrace::setShowAddresses(config().getBool("show_addresses_in_stack_traces", true));
 
-    const size_t buddy_arena_size = 10_GiB;
+    const size_t buddy_arena_size = 32_GiB;
     const size_t buddy_minimal_block_size = 16;
     auto& buddy_instance = DB::BuddyArena::instance();
     buddy_instance.initialize(buddy_minimal_block_size, buddy_arena_size);
@@ -1415,7 +1415,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
     /// Size of cache for uncompressed blocks. Zero means disabled.
     String uncompressed_cache_policy = config().getString("uncompressed_cache_policy", "unified");
     LOG_INFO(log, "Uncompressed cache policy name {}", uncompressed_cache_policy);
-    size_t uncompressed_cache_size = config().getUInt64("uncompressed_cache_size", 0);
+    size_t uncompressed_cache_size = config().getUInt64("uncompressed_cache_size", 5368709120);
     if (uncompressed_cache_size > max_cache_size)
     {
         uncompressed_cache_size = max_cache_size;
