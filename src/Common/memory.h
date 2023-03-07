@@ -36,14 +36,14 @@ inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
     auto & instance = DB::BuddyArena::instance();
     if constexpr (sizeof...(TAlign) == 1)
     {
-        if (instance.isValid())
+        if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
             ptr = instance.malloc(size, alignToSizeT(align...));
         else
             ptr = aligned_alloc(alignToSizeT(align...), size);
     } 
     else
     {
-        if (instance.isValid())
+        if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
             ptr = instance.malloc(size);
         else
             ptr = malloc(size);
@@ -59,7 +59,7 @@ inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
 inline ALWAYS_INLINE void * newNoExept(std::size_t size) noexcept
 {
     auto & instance = DB::BuddyArena::instance();
-    if (instance.isValid())
+    if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
         return instance.malloc(size);
     else
         return malloc(size);
@@ -68,7 +68,7 @@ inline ALWAYS_INLINE void * newNoExept(std::size_t size) noexcept
 inline ALWAYS_INLINE void * newNoExept(std::size_t size, std::align_val_t align) noexcept
 {
     auto & instance = DB::BuddyArena::instance();
-    if (instance.isValid())
+    if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
         return instance.malloc(size, static_cast<size_t>(align));
     else 
         return aligned_alloc(static_cast<size_t>(align), size);

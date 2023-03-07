@@ -88,6 +88,7 @@ public:
     static void * alloc(size_t size, size_t alignment = 0)
     {
         checkSize(size);
+        CurrentMemoryTracker::allocNoThrow(size);
         return allocNoTrack(size, alignment);
     }
 
@@ -98,6 +99,7 @@ public:
         {
             checkSize(size);
             freeNoTrack(buf, size);
+            CurrentMemoryTracker::free(size);
         }
         catch (...)
         {
@@ -152,7 +154,8 @@ private:
     {
         auto & instance = DB::BuddyArena::instance();
         void * buf = nullptr;
-        if (instance.isValid()) 
+
+        if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
         {
             buf = instance.malloc(size, alignment);
 
@@ -188,7 +191,7 @@ private:
         return buf;
     }
 
-    static void freeNoTrack(void * buf, size_t size)
+    static void freeNoTrack(void * buf, size_t /*size*/)
     {
         if (nullptr == buf) {
             return;
@@ -196,7 +199,7 @@ private:
 
         auto & instance = DB::BuddyArena::instance();
         if (instance.isValid() && instance.isAllocated(buf)) 
-            instance.free(buf, size);
+            instance.free(buf);
         else
             ::free(buf);
     }
