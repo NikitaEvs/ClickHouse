@@ -443,6 +443,23 @@ void * BuddyAllocator::realloc(void * buf, size_t old_size, size_t new_size, siz
         /// nothing to do.
         /// BTW, it's not possible to change alignment while doing realloc.
     }
+    /// TODO: Remove hardcoded constant, only for temporary tests of base Allocator replacement
+    // else if (alignment <= MALLOC_MIN_ALIGNMENT)
+    else if (old_size < DB::UNIFIED_ALLOC_THRESHOLD && new_size < DB::UNIFIED_ALLOC_THRESHOLD 
+             && alignment <= 8)
+    {
+        /// Resize malloc'd memory region with no special alignment requirement.
+        CurrentMemoryTracker::realloc(old_size, new_size);
+
+        void * new_buf = ::realloc(buf, new_size);
+        if (nullptr == new_buf)
+            DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot realloc from {} to {}.", ReadableSize(old_size), ReadableSize(new_size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+
+        buf = new_buf;
+        if constexpr (clear_memory)
+            if (new_size > old_size)
+                memset(reinterpret_cast<char *>(buf) + old_size, 0, new_size - old_size);
+    }
     else
     {
         /// Big allocs that requires a copy. MemoryTracker is called inside 'alloc', 'free' methods.
@@ -452,8 +469,6 @@ void * BuddyAllocator::realloc(void * buf, size_t old_size, size_t new_size, siz
         free(buf, old_size);
         buf = new_buf;
     }
-
-    // LOG_INFO(&Poco::Logger::get("UnifiedCache"), "BuddyAllocator: Reallocate buffer {} with old size {} and new size {} (do realloc)", buf, ReadableSize(old_size), ReadableSize(new_size));
 
     return buf;
 }
