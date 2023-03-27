@@ -3,7 +3,7 @@
 
 namespace DB {
 
-extern const size_t UNIFIED_ALLOC_THRESHOLD = static_cast<size_t>(10) * 1024 * 1024 * 1024;
+extern const size_t UNIFIED_ALLOC_THRESHOLD = static_cast<size_t>(2) * 1024;
 
 BuddyArena::~BuddyArena() noexcept
 {
@@ -103,7 +103,6 @@ void * BuddyArena::malloc(size_t size, size_t align)
 
     auto level = calculateLevel(size, align);
 
-    std::lock_guard lock(mutex);
     auto * block = allocateBlock(level);
     setPointerLevel(block, level);
 
@@ -122,7 +121,6 @@ void BuddyArena::free(void * buf) noexcept
     auto * block = reinterpret_cast<MemoryBlock *>(buf);
     auto level = getPointerLevel(block);
 
-    std::lock_guard lock(mutex);
     deallocateBlock(block, level);
 
     /// TODO: Remove temp local dummy memory tracker
@@ -244,43 +242,73 @@ void BuddyArena::setPointerLevel(const MemoryBlock * block, size_t level)
 
 BuddyArena::MemoryBlock * BuddyArena::allocateBlock(size_t level) 
 {
-    // Found free block in the list
-    if (!isFreeListEmpty(level))
+    MemoryBlock * free_block = nullptr;
+    size_t current_level = level;
+    do 
     {
-        auto * free_block = free_lists[level];
-        removeFromFreeList(free_block, level);
-        return free_block;
-    }
+        std::lock_guard lock(mutexes[current_level]);
 
-    // There are no free blocks on this level, allocate one from the top
+        /// Found free block on this level
+        if (!isFreeListEmpty(current_level)) 
+        {
+            free_block = free_lists[current_level];
+            removeFromFreeList(free_block, current_level);
+            break;
+        }
 
-    // Already on the top
-    if (level == 0) 
+        /// There are no free blocks on this level, allocate one from the top
+        if (current_level == 0)
+            break;
+        --current_level;
+    } while (current_level != 0);
+
+    /// Already on the top without free blocks
+    if (free_block == nullptr) 
         throw std::bad_alloc();
 
-    auto * bigger_block = allocateBlock(level - 1);
-    auto [block, buddy_block] = divideBlock(bigger_block, level - 1);
-    addToFreeList(buddy_block, level);
+    /// Iterate from current_level to the level and split free_block
+    while (current_level != level) 
+    {
+        auto [block, buddy_block] = divideBlock(free_block, current_level);
+        {
+            std::lock_guard lock(mutexes[current_level + 1]);
+            addToFreeList(buddy_block, current_level + 1);
+        }
+        free_block = block;
+        ++current_level;
+    }
 
-    return block;
+    return free_block;
 }
 
 void BuddyArena::deallocateBlock(MemoryBlock * block, size_t level) 
 {
     assert(block);
 
-    auto * buddy = getBuddy(block, level);
+    size_t current_level = level;
+    MemoryBlock * current_block = block;
+    
+    do 
+    {
+        std::lock_guard lock(mutexes[current_level]);
 
-    if (buddy && getBlockStatus(buddy, level)) 
-    {
-        // Merge with buddy
-        auto * merged_block = mergeWithBuddy(block, buddy);
-        removeFromFreeList(buddy, level);
-        deallocateBlock(merged_block, level - 1);
-    } else 
-    {
-        addToFreeList(block, level);
-    }  
+        auto * buddy = getBuddy(current_block, current_level);
+        if (buddy && getBlockStatus(buddy, current_level)) 
+        {
+            // Merge with buddy
+            auto * merged_block = mergeWithBuddy(current_block, buddy);
+            removeFromFreeList(buddy, current_level);
+            current_block = merged_block;
+        } else 
+        {
+            addToFreeList(current_block, current_level);
+            break;
+        }  
+
+        if (current_level == 0)
+            break;
+        --current_level;
+    } while (current_level != 0);
 }
 
 char * BuddyArena::initializeMetaStorage() 
@@ -296,6 +324,9 @@ char * BuddyArena::initializeMetaStorage()
     size_t pointers_levels_size = (1ull << (number_of_levels - 1));
     size_t pointers_levels_size_bytes = sizeof(uint8_t) * pointers_levels_size;
     size_t pointers_levels_size_minmal_blocks = calculateMinBlocksNumber(pointers_levels_size_bytes);
+
+    size_t mutexes_size_bytes = sizeof(std::mutex) * number_of_levels;
+    size_t mutexes_size_minimal_blocks = calculateMinBlocksNumber(mutexes_size_bytes);
         
     // Populate pointers 
     auto * current_storage_ptr = reinterpret_cast<char *>(arena_buffer);
@@ -308,6 +339,9 @@ char * BuddyArena::initializeMetaStorage()
 
     pointers_levels = reinterpret_cast<uint8_t *>(current_storage_ptr);
     current_storage_ptr += pointers_levels_size_minmal_blocks * minimal_allocation_size_bytes;
+
+    mutexes = reinterpret_cast<std::mutex *>(current_storage_ptr);
+    current_storage_ptr += mutexes_size_minimal_blocks * minimal_allocation_size_bytes;
 
     return current_storage_ptr;
 }

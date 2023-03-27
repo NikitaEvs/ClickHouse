@@ -91,12 +91,11 @@ private:
     std::atomic<size_t> free_min_blocks = 0;
     size_t min_blocks_num = 0;
 
-    std::mutex mutex;
-
     /// Meta storage 
     bool * block_status;
     uint8_t * pointers_levels;
     MemoryBlock ** free_lists;
+    std::mutex * mutexes;
 
     [[nodiscard]] static void * allocateArena(size_t size); 
     static void deallocateArena(void * buffer, size_t size);
