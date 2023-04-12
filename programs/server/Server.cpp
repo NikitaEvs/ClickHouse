@@ -11,6 +11,7 @@
 #include <Poco/Net/NetException.h>
 #include <Poco/Util/HelpFormatter.h>
 #include <Poco/Environment.h>
+#include <Common/UnifiedCache.h>
 #include <Common/scope_guard_safe.h>
 #include <Common/logger_useful.h>
 #include <base/phdr_cache.h>
@@ -1392,6 +1393,10 @@ int Server::main(const std::vector<std::string> & /*args*/)
     global_context->getProcessList().setMaxSize(config().getInt("max_concurrent_queries", 0));
 
     /// Set up caches.
+
+    auto block_cache_size = 2000_MiB;
+    auto & block_cache = DB::GlobalBlockCache<UInt128>::instance();
+    block_cache.initialize(block_cache_size);
 
     /// Lower cache size on low-memory systems.
     double cache_size_to_ram_max_ratio = config().getDouble("cache_size_to_ram_max_ratio", 0.5);

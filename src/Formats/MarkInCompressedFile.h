@@ -40,15 +40,69 @@ struct MarkInCompressedFile
 
 };
 
-class MarksInCompressedFile : public PODArray<MarkInCompressedFile>
+class MarksInCompressedFile final: boost::noncopyable, Allocator<false>
 {
 public:
-    explicit MarksInCompressedFile(size_t n) : PODArray(n) {}
+    MarksInCompressedFile() = default;
 
-    void read(ReadBuffer & buffer, size_t from, size_t count)
+    explicit MarksInCompressedFile(size_t marks_size_)
+        : marks_size(marks_size_)
+        , marks_data(Allocator::alloc(marks_size * sizeof(MarkInCompressedFile)))
+        , owns_marks_data(true)
+    {}
+
+    MarksInCompressedFile(size_t marks_size_, void * marks_data_)
+        : marks_size(marks_size_)
+        , marks_data(marks_data_)
+        , owns_marks_data(false)
+    {}
+
+    MarksInCompressedFile(MarksInCompressedFile&& rhs) noexcept
+    {
+        *this = std::move(rhs);
+    }
+
+    MarksInCompressedFile& operator=(MarksInCompressedFile&& rhs) noexcept
+    {
+        std::swap(marks_size, rhs.marks_size);
+        std::swap(owns_marks_data, rhs.owns_marks_data);
+        std::swap(marks_data, rhs.marks_data);
+
+        return *this;
+    }
+
+    inline void read(ReadBuffer & buffer, size_t from, size_t count)
     {
         buffer.readStrict(reinterpret_cast<char *>(data() + from), count * sizeof(MarkInCompressedFile));
     }
+
+    inline const MarkInCompressedFile * data() const { return static_cast<MarkInCompressedFile*>(marks_data); }
+
+    inline MarkInCompressedFile * data() { return static_cast<MarkInCompressedFile*>(marks_data); }
+
+    inline const MarkInCompressedFile & operator[](size_t i) const { return data()[i]; }
+
+    inline MarkInCompressedFile & operator[](size_t i) { return data()[i]; }
+
+    inline size_t size() const { return marks_size; }
+
+    ~MarksInCompressedFile()
+    {
+        dealloc();
+    }
+private:
+    inline void dealloc()
+    {
+        if (owns_marks_data && marks_data)
+        {
+            Allocator::free(marks_data, marks_size * sizeof(MarkInCompressedFile));
+            marks_data = nullptr;    /// To avoid double free if next alloc will throw an exception
+        }
+    }
+
+    size_t marks_size = 0;
+    void * marks_data = nullptr;
+    bool owns_marks_data = false;
 };
 
 }
