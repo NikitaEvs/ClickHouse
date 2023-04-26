@@ -1,6 +1,7 @@
 #include "MemoryTracker.h"
 
 #include <IO/WriteHelpers.h>
+#include <Common/UnifiedCache.h>
 #include <Common/VariableContext.h>
 #include <Interpreters/TraceCollector.h>
 #include <Common/Exception.h>
@@ -168,6 +169,7 @@ void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded, MemoryT
 
     Int64 current_hard_limit = hard_limit.load(std::memory_order_relaxed);
     Int64 current_profiler_limit = profiler_limit.load(std::memory_order_relaxed);
+    Int64 current_limit_to_purge_cache = limit_to_purge_cache.load(std::memory_order_relaxed);
 
     bool memory_limit_exceeded_ignored = false;
 
@@ -236,6 +238,14 @@ void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded, MemoryT
         limit_to_check += abs(current_free_memory_in_allocator_arenas);
     }
 #endif
+
+    /// TODO: Rewrite with a rebalance strategy
+    if (unlikely(current_limit_to_purge_cache && will_be > current_limit_to_purge_cache))
+    {
+        auto & cache_instance = DB::GlobalBlockCache<UInt128>::instance();
+        /// TODO: Make a better shrinkage with a relative ration to the full amount of memory
+        cache_instance.purge();
+    }
 
     if (unlikely(current_hard_limit && will_be > limit_to_check))
     {
@@ -456,6 +466,10 @@ void MemoryTracker::setHardLimit(Int64 value)
     hard_limit.store(value, std::memory_order_relaxed);
 }
 
+void MemoryTracker::setLimitToPurgeCache(Int64 value)
+{
+    limit_to_purge_cache.store(value, std::memory_order_relaxed);
+}
 
 void MemoryTracker::setOrRaiseHardLimit(Int64 value)
 {

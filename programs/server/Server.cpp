@@ -1146,6 +1146,8 @@ int Server::main(const std::vector<std::string> & /*args*/)
             }
 
             total_memory_tracker.setHardLimit(max_server_memory_usage);
+            /// TODO: Add setting
+            total_memory_tracker.setLimitToPurgeCache(1500_MiB);
             total_memory_tracker.setDescription("(total)");
             total_memory_tracker.setMetric(CurrentMetrics::MemoryTracking);
 
@@ -1393,10 +1395,10 @@ int Server::main(const std::vector<std::string> & /*args*/)
     global_context->getProcessList().setMaxSize(config().getInt("max_concurrent_queries", 0));
 
     /// Set up caches.
-
-    auto block_cache_size = 2000_MiB;
+    auto block_cache_size = 1000_MiB;
+    auto max_size_to_evict_on_purging = 300_MiB;
     auto & block_cache = DB::GlobalBlockCache<UInt128>::instance();
-    block_cache.initialize(block_cache_size);
+    block_cache.initialize(block_cache_size, max_size_to_evict_on_purging);
 
     /// Lower cache size on low-memory systems.
     double cache_size_to_ram_max_ratio = config().getDouble("cache_size_to_ram_max_ratio", 0.5);

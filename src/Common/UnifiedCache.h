@@ -5,6 +5,7 @@
 #include <Core/Types.h>
 #include <Interpreters/Context.h>
 #include <atomic>
+#include <memory>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/set.hpp>
 #include <boost/core/noncopyable.hpp>
@@ -16,6 +17,48 @@ template <typename Key>
 class BlockCache : private boost::noncopyable
 {
 private:
+    struct ChunkStorageListTag;
+
+    using ChunkStorageListHook = boost::intrusive::list_base_hook<boost::intrusive::tag<ChunkStorageListTag>>;
+
+    struct Chunk : public ChunkStorageListHook, private boost::noncopyable
+    {
+        void * ptr;
+        size_t size;
+
+        Chunk(Chunk && other) noexcept : ptr(other.ptr), size(other.size)
+        {
+            other.ptr = nullptr;
+        }
+
+        static Chunk * create(size_t size_)
+        {
+            return new Chunk(size_);
+        }
+
+        void destroy()
+        {
+            delete this;
+        }
+
+    private:
+        explicit Chunk(size_t size_);
+        ~Chunk();
+    };
+
+    using ChunkStorageList = boost::intrusive::list<Chunk,
+        boost::intrusive::base_hook<ChunkStorageListHook>, boost::intrusive::constant_time_size<true>>;
+
+    /** Invariants:
+     * acquired_chunks contains all chunks which contain at least one non-free region
+     * free_chunks contains all chunks which contain exactly once free region
+     */
+    ChunkStorageList acquired_chunks;
+    ChunkStorageList free_chunks; 
+
+    // using Chunks = std::list<Chunk>;
+    // Chunks chunks;
+
     struct LRUListTag;
     struct AdjacencyListTag;
     struct SizeMultimapTag;
@@ -37,7 +80,7 @@ private:
         };
         size_t size;
         size_t refcount = 0;
-        void * chunk;
+        Chunk * chunk;
 
         bool operator< (const RegionMetadata & other) const { return size < other.size; }
 
@@ -51,6 +94,11 @@ private:
         void destroy()
         {
             delete this;
+        }
+
+        [[nodiscard]] bool isChunkOwner() const
+        {
+            return chunk != nullptr && ptr == chunk->ptr && chunk->size == size;
         }
 
     private:
@@ -103,25 +151,8 @@ private:
 
     mutable std::mutex mutex;
 
-    struct Chunk : private boost::noncopyable
-    {
-        void * ptr;
-        size_t size;
-
-        explicit Chunk(size_t size_); 
-
-        ~Chunk();
-
-        Chunk(Chunk && other) noexcept : ptr(other.ptr), size(other.size)
-        {
-            other.ptr = nullptr;
-        }
-    };
-
-    using Chunks = std::list<Chunk>;
-    Chunks chunks;
-
     size_t max_total_size = 0;
+    size_t max_size_to_evict_on_purging = 0;
 
     /// We will allocate memory in chunks of at least that size.
     /// 64 MB makes mmap overhead comparable to memory throughput.
@@ -133,7 +164,8 @@ private:
     std::atomic<size_t> total_useful_cache_size = 0;
     std::atomic<size_t> total_useful_cache_count = 0;
  
-    RegionMetadata * addNewChunk(size_t size);
+    RegionMetadata * addNewChunk(Chunk * chunk);
+    RegionMetadata * allocateNewChunk(size_t size);
     RegionMetadata * allocateFromFreeRegion(RegionMetadata * free_region, size_t size);
 
     RegionMetadata * allocate(size_t size);
@@ -141,6 +173,8 @@ private:
 
     void evictRegion(RegionMetadata * evicted_region) noexcept;
     RegionMetadata * evictSome(size_t requested_size) noexcept;
+
+    void shrink(size_t max_size_to_evict);
 
 public:
     struct Holder : private boost::noncopyable
@@ -177,7 +211,11 @@ public:
 
     ~BlockCache();
 
-    void initialize(size_t max_total_size_) { max_total_size = max_total_size_; }
+    void initialize(size_t max_total_size_, size_t max_size_to_evict_on_purging_) 
+    { 
+        max_total_size = max_total_size_; 
+        max_size_to_evict_on_purging = max_size_to_evict_on_purging_;
+    }
 
     /// Applications isn't supposed to call these methods directly without 
     /// proxy classes to hold raw pointers
@@ -221,7 +259,8 @@ public:
 
         /// Statistics
         if (region) {
-            total_useful_cache_size.fetch_add(size, std::memory_order_relaxed);
+            std::cerr << "Size: " << size << " region size: " << region->size << std::endl;
+            total_useful_cache_size.fetch_add(region->size, std::memory_order_relaxed);
             total_useful_cache_count.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -232,11 +271,17 @@ public:
 
     void reset();
 
+    void purge();
+
     bool isValid() const { return max_total_size != 0; }
 
     size_t getCacheWeight() const;
 
     size_t getCacheCount() const;
+
+    ChunkStorageList takeChunks(size_t max_size_to_evict);
+
+    void addNewChunks(ChunkStorageList & chunk_list);
 };
 
 template <typename Key>
@@ -256,7 +301,8 @@ private:
 
 // Unified interface for the access to items from the cache and items not from the cache
 template <typename Payload>
-struct PayloadHolder {
+struct PayloadHolder 
+{
     PayloadHolder() = default;
     virtual ~PayloadHolder() = default;
 
@@ -275,7 +321,8 @@ struct PayloadHolder {
 // Simple holder for the pointer with an unified interface with CachePayloadHolder
 // Used to unify access to the cache items and non-cache items
 template <typename Payload>
-struct SharedPayloadHolder : public PayloadHolder<Payload> {
+struct SharedPayloadHolder : public PayloadHolder<Payload> 
+{
     /// Adopt payload_ptr_ and own a memory for it
     explicit SharedPayloadHolder(Payload * payload_ptr_)
         : payload_ptr(payload_ptr_) 
@@ -290,7 +337,8 @@ private:
 };
 
 template <typename TKey, typename Payload>
-class UnifiedCacheAdapter {
+class UnifiedCacheAdapter 
+{
 public:
     using Key = TKey; 
     using HolderPtr = typename BlockCache<Key>::HolderPtr;
@@ -344,7 +392,8 @@ public:
 
     void reset()
     {
-        /// TODO: implement
+        /// TODO: implement support for the resetting some specific type of cache
+        instance.reset();
     }
 
     size_t weight() const

@@ -44,23 +44,28 @@ BlockCache<Key>::Holder::~Holder()
 }
 
 template <typename Key>
-typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::addNewChunk(size_t size)
+typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::addNewChunk(Chunk * chunk)
 {
-    chunks.emplace_back(size);
-    auto & chunk = chunks.back();
-
-    total_chunks_size += size;
+    total_chunks_size += chunk->size;
 
     auto * free_region = RegionMetadata::create();
-    free_region->ptr = chunk.ptr;
+    free_region->ptr = chunk->ptr;
     assert(free_region->ptr != nullptr);
-    free_region->chunk = chunk.ptr;
-    free_region->size = chunk.size;
+    free_region->chunk = chunk;
+    free_region->size = chunk->size;
 
     adjacency_list.push_back(*free_region);
     size_multimap.insert(*free_region);
+    free_chunks.push_back(*chunk);
 
     return free_region;
+}
+
+template <typename Key>
+typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateNewChunk(size_t size)
+{
+    auto * chunk = Chunk::create(size);
+    return addNewChunk(chunk);
 }
 
 /// Precondition: free_region.size >= size.
@@ -72,6 +77,11 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateFromFreeRegi
 
     if (free_region->size == size)
     {
+        // Move chunk from free list to the acquired list if the region was the only one in the chunk
+        if (free_region->isChunkOwner()) {
+            free_chunks.erase(free_chunks.iterator_to(*free_region->chunk));
+            acquired_chunks.push_back(*free_region->chunk);
+        }
         size_multimap.erase(size_multimap.iterator_to(*free_region));
         return free_region;
     }
@@ -82,9 +92,15 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateFromFreeRegi
     allocated_region->chunk = free_region->chunk;
     allocated_region->size = size;
 
+    // Move chunk from free list to the acquired list if the region was the only one in the chunk
+    if (free_region->isChunkOwner()) {
+        free_chunks.erase(free_chunks.iterator_to(*free_region->chunk));
+        acquired_chunks.push_back(*free_region->chunk);
+    }
     size_multimap.erase(size_multimap.iterator_to(*free_region));
     free_region->size -= size;
     free_region->char_ptr += size;
+    // Do not add corresponding chunk in the acquired_chunks as we've alredy did it for the free_region
     size_multimap.insert(*free_region);
 
     adjacency_list.insert(adjacency_list.iterator_to(*free_region), *allocated_region);
@@ -113,7 +129,7 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocate(size_t size
     if (total_chunks_size + required_chunk_size <= max_total_size)
     {
         /// Create free region spanning through chunk.
-        RegionMetadata * free_region = addNewChunk(required_chunk_size);
+        RegionMetadata * free_region = allocateNewChunk(required_chunk_size);
         return allocateFromFreeRegion(free_region, size);
     }
 
@@ -171,6 +187,10 @@ void BlockCache<Key>::freeRegion(typename BlockCache<Key>::RegionMetadata * regi
     }
 
     size_multimap.insert(*region);
+    if (region->isChunkOwner()) {
+        acquired_chunks.erase(acquired_chunks.iterator_to(*region->chunk));
+        free_chunks.push_back(*region->chunk);
+    }
 }
 
 template <typename Key>
@@ -199,11 +219,15 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::evictSome(size_t req
     while (true)
     {
         RegionMetadata & evicted_region = *it;
-        evictRegion(&evicted_region);
 
         /// Statistics
+        /// Note: change total_useful_size before eviction of the region as we could coalesce with neighbors regions (which can be initially free)
         total_useful_cache_size.fetch_sub(evicted_region.size, std::memory_order_relaxed);
         total_useful_cache_count.fetch_sub(1, std::memory_order_relaxed);
+
+        evictRegion(&evicted_region);
+
+        std::cerr << "Total useful cache size: " << total_useful_cache_size.load() << " evicted region size " << evicted_region.size << std::endl;
 
         if (evicted_region.size >= requested_size)
             return &evicted_region;
@@ -215,12 +239,22 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::evictSome(size_t req
 }
 
 template <typename Key>
+void BlockCache<Key>::shrink(size_t max_size_to_evict)
+{
+    auto chunks = takeChunks(max_size_to_evict);
+    chunks.clear_and_dispose([](Chunk * chunk) { chunk->destroy(); });
+}
+
+template <typename Key>
 BlockCache<Key>::~BlockCache()
 {
     key_map.clear();
     size_multimap.clear();
     lru_list.clear();
     adjacency_list.clear_and_dispose([](RegionMetadata * elem) { elem->destroy(); });
+
+    acquired_chunks.clear_and_dispose([](Chunk * chunk) { chunk->destroy(); });
+    free_chunks.clear_and_dispose([](Chunk * chunk) { chunk->destroy(); });
 }
 
 template <typename Key>
@@ -239,7 +273,13 @@ typename BlockCache<Key>::HolderPtr BlockCache<Key>::get(const Key & key)
 template <typename Key>
 void BlockCache<Key>::reset()
 {
+    shrink(total_chunks_size);
+}
 
+template <typename Key>
+void BlockCache<Key>::purge()
+{
+    shrink(max_size_to_evict_on_purging);
 }
 
 template <typename Key>
@@ -253,6 +293,65 @@ size_t BlockCache<Key>::getCacheCount() const
 {
     return total_useful_cache_count.load(std::memory_order_relaxed);
 }
+
+template <typename Key>
+typename BlockCache<Key>::ChunkStorageList BlockCache<Key>::takeChunks(size_t max_size_to_evict)
+{
+    std::lock_guard lock(mutex);
+    
+    /// Firstly, try to evict entries
+    /// If max_size_to_evict == 0, take only free chunks in the moment
+    size_t evicted_size = 0;
+    while (evicted_size < max_size_to_evict) 
+    {
+        std::cerr << "Already evicted: " << evicted_size << " , to evict: " << max_size_to_evict - evicted_size;
+        const auto * evicted_region = evictSome(max_size_to_evict - evicted_size);
+        if (evicted_region == nullptr)
+            break;
+        evicted_size += evicted_region->size;
+    }
+
+    /// Secondly, take all free chunks
+    ChunkStorageList list; 
+    list.swap(free_chunks);
+    
+    /// Thirdly, remove all free regions from sizemap as we will take chunks under them
+    /// TODO: Optimize full scan of sizemap here, we can do linear scan before eviction (as normally we wouldn't have a lot of free regions) 
+    /// and then add some flag to the evictSome function says that we don't need to add to the sizemap free regions which cover whole chunks
+
+    /// All regions with smaller sizes won't cover the whole chunk
+    auto it = size_multimap.lower_bound(min_chunk_size, RegionCompareBySize());
+    while (it != size_multimap.end()) 
+    {
+        if (it->isChunkOwner()) 
+        {
+            auto previous_it = it;
+            ++it;
+            size_multimap.erase(previous_it);
+        } else 
+        {
+            ++it;
+        }
+    }
+
+    /// TODO: Remove it after moving to the rebalance strategy
+    for (const auto & chunk : list) {
+        total_chunks_size -= chunk.size;
+    }
+
+    return list;
+}
+
+template <typename Key>
+void BlockCache<Key>::addNewChunks(typename BlockCache<Key>::ChunkStorageList & chunk_list)
+{
+    std::lock_guard lock(mutex);
+
+    /// Populate 
+    for (auto & chunk : chunk_list) 
+        addNewChunk(&chunk);
+}
+
 
 template class BlockCache<UInt128>;
 
