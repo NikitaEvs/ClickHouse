@@ -26,8 +26,7 @@ private:
     using HolderPtr = Base::CachePayloadHolderPtr;
 
 public:
-    // TODO: Remove size and policy parameters from the constructor
-    explicit MarkCache(size_t /*max_size_in_bytes*/, const String & /*mark_cache_policy*/ = "") 
+    explicit MarkCache(const String & block_cache_name) : Base(block_cache_name) 
     {}
 
     /// Calculate key from path to file and offset.
