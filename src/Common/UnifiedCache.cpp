@@ -1,27 +1,28 @@
 #include <Common/UnifiedCache.h>
+#include "Access/ContextAccess.h"
 #include <Core/Types.h>
 #include <base/getPageSize.h>
 #include <atomic>
 #include <cstdlib>
+#include <string_view>
 #include <sys/mman.h>
 
 namespace DB 
 {
 
-template <typename Key>
-BlockCache<Key>::Chunk::Chunk(size_t size_) : size(size_)
+MemoryBlock::MemoryBlock(size_t size_) : size(size_)
 {
     ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (MAP_FAILED == ptr)
         DB::throwFromErrno(fmt::format("BlockCache: Cannot mmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
 }
 
-template <typename Key>
-BlockCache<Key>::Chunk::~Chunk()
+MemoryBlock::~MemoryBlock()
 {
     if (ptr && 0 != munmap(ptr, size))
         DB::throwFromErrno(fmt::format("BlockCache: Cannot munmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_MUNMAP);
 }
+
 
 template <typename Key>
 BlockCache<Key>::Holder::Holder(BlockCache<Key> & cache_, BlockCache<Key>::RegionMetadata & region_, std::lock_guard<std::mutex>&)
@@ -44,43 +45,38 @@ BlockCache<Key>::Holder::~Holder()
 }
 
 template <typename Key>
-typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::addNewChunk(Chunk * chunk)
+typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::addNewRegion(
+    MemoryBlock & memory_block, 
+    std::lock_guard<std::mutex> & /*cache_lock*/)
 {
-    total_chunks_size += chunk->size;
-
     auto * free_region = RegionMetadata::create();
-    free_region->ptr = chunk->ptr;
+    free_region->ptr = memory_block.ptr;
     assert(free_region->ptr != nullptr);
-    free_region->chunk = chunk;
-    free_region->size = chunk->size;
+    free_region->memory_block = &memory_block;
+    free_region->size = memory_block.size;
 
     adjacency_list.push_back(*free_region);
     size_multimap.insert(*free_region);
-    free_chunks.push_back(*chunk);
 
     return free_region;
 }
 
 template <typename Key>
-typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateNewChunk(size_t size)
-{
-    auto * chunk = Chunk::create(size);
-    return addNewChunk(chunk);
-}
-
-/// Precondition: free_region.size >= size.
-template <typename Key>
-typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateFromFreeRegion(typename BlockCache<Key>::RegionMetadata * free_region, size_t size)
+typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateFromFreeRegion(
+    typename BlockCache<Key>::RegionMetadata * free_region, 
+    size_t size,
+    std::lock_guard<std::mutex> & /*cache_lock*/)
 {
     if (!free_region)
         return nullptr;
 
     if (free_region->size == size)
     {
-        // Move chunk from free list to the acquired list if the region was the only one in the chunk
-        if (free_region->isChunkOwner()) {
-            free_chunks.erase(free_chunks.iterator_to(*free_region->chunk));
-            acquired_chunks.push_back(*free_region->chunk);
+        // Move memory blocks from free list to the acquired list if the region was the only one in the block 
+        if (free_region->isBlockOwner()) 
+        {
+            free_memory_blocks.erase(free_memory_blocks.iterator_to(*free_region->memory_block));
+            acquired_memory_blocks.push_back(*free_region->memory_block);
         }
         size_multimap.erase(size_multimap.iterator_to(*free_region));
         return free_region;
@@ -89,18 +85,19 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocateFromFreeRegi
     auto * allocated_region = RegionMetadata::create();
     allocated_region->ptr = free_region->ptr;
     assert(allocated_region->ptr != nullptr);
-    allocated_region->chunk = free_region->chunk;
+    allocated_region->memory_block = free_region->memory_block;
     allocated_region->size = size;
 
-    // Move chunk from free list to the acquired list if the region was the only one in the chunk
-    if (free_region->isChunkOwner()) {
-        free_chunks.erase(free_chunks.iterator_to(*free_region->chunk));
-        acquired_chunks.push_back(*free_region->chunk);
+    // Move block from free list to the acquired list if the region was the only one in the block 
+    if (free_region->isBlockOwner()) 
+    {
+        free_memory_blocks.erase(free_memory_blocks.iterator_to(*free_region->memory_block));
+        acquired_memory_blocks.push_back(*free_region->memory_block);
     }
     size_multimap.erase(size_multimap.iterator_to(*free_region));
     free_region->size -= size;
     free_region->char_ptr += size;
-    // Do not add corresponding chunk in the acquired_chunks as we've alredy did it for the free_region
+    // Do not add corresponding block in the acquired_blocks as we've alredy did it for the free_region
     size_multimap.insert(*free_region);
 
     adjacency_list.insert(adjacency_list.iterator_to(*free_region), *allocated_region);
@@ -113,29 +110,28 @@ static size_t roundUp(size_t x, size_t rounding)
 }
 
 template <typename Key>
-typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocate(size_t size)
+typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocate(size_t size, std::lock_guard<std::mutex> & cache_lock)
 {
     size = roundUp(size, alignment);
 
-    /// Look up to size multimap to find free region of specified size.
+    /// Fast path. Look up to size multimap to find free region of specified size.
     auto it = size_multimap.lower_bound(size, RegionCompareBySize());
     if (size_multimap.end() != it)
-        return allocateFromFreeRegion(&*it, size);
+        return allocateFromFreeRegion(&*it, size, cache_lock);
 
-    /// If nothing was found and total size of allocated chunks plus required size is lower than maximum,
-    ///  allocate a new chunk.
-    size_t page_size = static_cast<size_t>(::getPageSize());
-    size_t required_chunk_size = std::max(min_chunk_size, roundUp(size, page_size));
-    if (total_chunks_size + required_chunk_size <= max_total_size)
+    /// If nothing was found, ask for rebalancing and check again for the space
+    if (rebalance_strategy) 
     {
-        /// Create free region spanning through chunk.
-        RegionMetadata * free_region = allocateNewChunk(required_chunk_size);
-        return allocateFromFreeRegion(free_region, size);
+        rebalance_strategy->shouldRebalance(name, size, cache_lock);
+        auto rebalanced_it = size_multimap.lower_bound(size, RegionCompareBySize());
+        if (size_multimap.end() != rebalanced_it)
+            return allocateFromFreeRegion(&*rebalanced_it, size, cache_lock);
     }
 
+    /// Start evictions
     while (true)
     {
-        RegionMetadata * res = evictSome(size);
+        RegionMetadata * res = evictSome(size, cache_lock);
 
         /// Nothing to evict. All cache is full and in use - cannot allocate memory.
         if (!res)
@@ -145,15 +141,12 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::allocate(size_t size
         if (res->size < size)
             continue;
 
-        return allocateFromFreeRegion(res, size);
+        return allocateFromFreeRegion(res, size, cache_lock);
     }
 }
 
-/// Precondition: region is not in lru_list, not in key_map, not in size_multimap.
-/// Postcondition: region is not in lru_list, not in key_map,
-///  inserted into size_multimap, possibly coalesced with adjacent free regions.
 template <typename Key>
-void BlockCache<Key>::freeRegion(typename BlockCache<Key>::RegionMetadata * region) noexcept
+void BlockCache<Key>::freeRegion(typename BlockCache<Key>::RegionMetadata * region, std::lock_guard<std::mutex> & /*cache_lock*/) noexcept
 {
     if (!region)
         return;
@@ -165,7 +158,7 @@ void BlockCache<Key>::freeRegion(typename BlockCache<Key>::RegionMetadata * regi
     {
         --left_it;
 
-        if (left_it->chunk == region->chunk && left_it->isFree())
+        if (left_it->memory_block == region->memory_block && left_it->isFree())
         {
             region->size += left_it->size;
             region->char_ptr -= left_it->size; 
@@ -178,7 +171,7 @@ void BlockCache<Key>::freeRegion(typename BlockCache<Key>::RegionMetadata * regi
     ++right_it;
     if (right_it != adjacency_list.end())
     {
-        if (right_it->chunk == region->chunk && right_it->isFree())
+        if (right_it->memory_block == region->memory_block && right_it->isFree())
         {
             region->size += right_it->size;
             size_multimap.erase(size_multimap.iterator_to(*right_it));
@@ -187,29 +180,25 @@ void BlockCache<Key>::freeRegion(typename BlockCache<Key>::RegionMetadata * regi
     }
 
     size_multimap.insert(*region);
-    if (region->isChunkOwner()) {
-        acquired_chunks.erase(acquired_chunks.iterator_to(*region->chunk));
-        free_chunks.push_back(*region->chunk);
+    if (region->isBlockOwner()) {
+        acquired_memory_blocks.erase(acquired_memory_blocks.iterator_to(*region->memory_block));
+        acquired_memory_blocks.push_back(*region->memory_block);
     }
 }
 
 template <typename Key>
-void BlockCache<Key>::evictRegion(RegionMetadata * evicted_region) noexcept
+void BlockCache<Key>::evictRegion(RegionMetadata * evicted_region, std::lock_guard<std::mutex> & cache_lock) noexcept
 {
     lru_list.erase(lru_list.iterator_to(*evicted_region));
 
     if (evicted_region->KeyMapHook::is_linked())
         key_map.erase(key_map.iterator_to(*evicted_region));
 
-    freeRegion(evicted_region);
+    freeRegion(evicted_region, cache_lock);
 }
 
-/// Evict region from cache and return it, coalesced with nearby free regions.
-/// While size is not enough, evict adjacent regions at right, if any.
-/// If nothing to evict, returns nullptr.
-/// Region is removed from lru_list and key_map and inserted into size_multimap.
 template <typename Key>
-typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::evictSome(size_t requested_size) noexcept
+typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::evictSome(size_t requested_size, std::lock_guard<std::mutex> & cache_lock) noexcept
 {
     if (lru_list.empty()) 
         return nullptr;
@@ -225,24 +214,25 @@ typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::evictSome(size_t req
         total_useful_cache_size.fetch_sub(evicted_region.size, std::memory_order_relaxed);
         total_useful_cache_count.fetch_sub(1, std::memory_order_relaxed);
 
-        evictRegion(&evicted_region);
-
-        std::cerr << "Total useful cache size: " << total_useful_cache_size.load() << " evicted region size " << evicted_region.size << std::endl;
+        evictRegion(&evicted_region, cache_lock);
 
         if (evicted_region.size >= requested_size)
             return &evicted_region;
 
         ++it;
-        if (it == adjacency_list.end() || it->chunk != evicted_region.chunk || !it->LRUListHook::is_linked())
+        if (it == adjacency_list.end() || 
+            it->memory_block != evicted_region.memory_block || 
+            !it->LRUListHook::is_linked())
             return &evicted_region;
     }
 }
 
 template <typename Key>
-void BlockCache<Key>::shrink(size_t max_size_to_evict)
+BlockCache<Key>::BlockCache(const std::string & name_, std::shared_ptr<RebalanceStrategy> rebalance_strategy_)
+    : name(name_), rebalance_strategy(std::move(rebalance_strategy_))
 {
-    auto chunks = takeChunks(max_size_to_evict);
-    chunks.clear_and_dispose([](Chunk * chunk) { chunk->destroy(); });
+    auto initial_memory_blocks = rebalance_strategy->initialize(name);
+    addNewMemoryBlocks(initial_memory_blocks);
 }
 
 template <typename Key>
@@ -253,8 +243,13 @@ BlockCache<Key>::~BlockCache()
     lru_list.clear();
     adjacency_list.clear_and_dispose([](RegionMetadata * elem) { elem->destroy(); });
 
-    acquired_chunks.clear_and_dispose([](Chunk * chunk) { chunk->destroy(); });
-    free_chunks.clear_and_dispose([](Chunk * chunk) { chunk->destroy(); });
+    auto remaining_blocks = std::move(acquired_memory_blocks);
+    remaining_blocks.splice(remaining_blocks.end(), free_memory_blocks);
+
+    rebalance_strategy->finalize(name, std::move(remaining_blocks));
+
+    acquired_memory_blocks.clear();
+    free_memory_blocks.clear();
 }
 
 template <typename Key>
@@ -271,18 +266,6 @@ typename BlockCache<Key>::HolderPtr BlockCache<Key>::get(const Key & key)
 }
 
 template <typename Key>
-void BlockCache<Key>::reset()
-{
-    shrink(total_chunks_size);
-}
-
-template <typename Key>
-void BlockCache<Key>::purge()
-{
-    shrink(max_size_to_evict_on_purging);
-}
-
-template <typename Key>
 size_t BlockCache<Key>::getCacheWeight() const
 {
     return total_useful_cache_size.load(std::memory_order_relaxed);
@@ -295,35 +278,32 @@ size_t BlockCache<Key>::getCacheCount() const
 }
 
 template <typename Key>
-typename BlockCache<Key>::ChunkStorageList BlockCache<Key>::takeChunks(size_t max_size_to_evict)
+MemoryBlockList BlockCache<Key>::takeMemoryBlocks(size_t max_size_to_evict, std::lock_guard<std::mutex> & cache_lock)
 {
-    std::lock_guard lock(mutex);
-    
     /// Firstly, try to evict entries
-    /// If max_size_to_evict == 0, take only free chunks in the moment
+    /// If max_size_to_evict == 0, take only free blocks in the moment
     size_t evicted_size = 0;
     while (evicted_size < max_size_to_evict) 
     {
-        std::cerr << "Already evicted: " << evicted_size << " , to evict: " << max_size_to_evict - evicted_size;
-        const auto * evicted_region = evictSome(max_size_to_evict - evicted_size);
+        const auto * evicted_region = evictSome(max_size_to_evict - evicted_size, cache_lock);
         if (evicted_region == nullptr)
             break;
         evicted_size += evicted_region->size;
     }
 
-    /// Secondly, take all free chunks
-    ChunkStorageList list; 
-    list.swap(free_chunks);
+    /// Secondly, take all free blocks 
+    MemoryBlockList list; 
+    list.swap(free_memory_blocks);
     
-    /// Thirdly, remove all free regions from sizemap as we will take chunks under them
+    /// Thirdly, remove all free regions from sizemap as we will take blocks under them
     /// TODO: Optimize full scan of sizemap here, we can do linear scan before eviction (as normally we wouldn't have a lot of free regions) 
-    /// and then add some flag to the evictSome function says that we don't need to add to the sizemap free regions which cover whole chunks
+    /// and then add some flag to the evictSome function says that we don't need to add to the sizemap free regions which cover whole block 
 
-    /// All regions with smaller sizes won't cover the whole chunk
-    auto it = size_multimap.lower_bound(min_chunk_size, RegionCompareBySize());
+    /// All regions with smaller sizes won't cover the whole block 
+    auto it = size_multimap.lower_bound(min_block_size, RegionCompareBySize());
     while (it != size_multimap.end()) 
     {
-        if (it->isChunkOwner()) 
+        if (it->isBlockOwner()) 
         {
             auto previous_it = it;
             ++it;
@@ -335,24 +315,268 @@ typename BlockCache<Key>::ChunkStorageList BlockCache<Key>::takeChunks(size_t ma
     }
 
     /// TODO: Remove it after moving to the rebalance strategy
-    for (const auto & chunk : list) {
-        total_chunks_size -= chunk.size;
+    for (const auto & block : list) {
+        total_memory_blocks_size -= block.size;
     }
 
     return list;
 }
 
 template <typename Key>
-void BlockCache<Key>::addNewChunks(typename BlockCache<Key>::ChunkStorageList & chunk_list)
+MemoryBlockList BlockCache<Key>::takeMemoryBlocks(size_t max_size_to_evict)
+{
+    std::lock_guard lock(mutex);
+    
+    return takeMemoryBlocks(max_size_to_evict, lock);
+}
+
+template <typename Key>
+void BlockCache<Key>::addNewMemoryBlocks(MemoryBlockList & memory_blocks, std::lock_guard<std::mutex> & cache_lock)
+{
+    /// Populate regions and update the total size
+    for (auto & block : memory_blocks) 
+    {
+        addNewRegion(block, cache_lock);
+        total_memory_blocks_size += block.size;
+    }
+
+    /// Add memory_blocks to the free_memory_blocks list
+    free_memory_blocks.splice(free_memory_blocks.end(), memory_blocks);
+}
+
+template <typename Key>
+void BlockCache<Key>::addNewMemoryBlocks(MemoryBlockList & memory_blocks)
 {
     std::lock_guard lock(mutex);
 
-    /// Populate 
-    for (auto & chunk : chunk_list) 
-        addNewChunk(&chunk);
+    addNewMemoryBlocks(memory_blocks, lock);
+}
+
+
+template <typename Key>
+DummyRebalanceStrategy<Key>::DummyRebalanceStrategy(
+    BlockCacheMapping & caches_, 
+    const BlockCacheSettingsMapping & cache_settings)
+    : Base(caches_)
+{
+    for (const auto & item : cache_settings)
+    {
+        const auto & cache_name = item.first;
+        const auto & cache_setting = item.second;
+        block_cache_stats.try_emplace(cache_name, cache_setting);
+    }
+}
+
+template <typename Key>
+MemoryBlockList DummyRebalanceStrategy<Key>::initialize(const std::string & /*caller_name*/) 
+{
+    // nop
+    return {};
+}
+
+template <typename Key>
+void DummyRebalanceStrategy<Key>::shouldRebalance(const std::string &caller_name, size_t new_item_size, std::lock_guard<std::mutex> &cache_lock)
+{
+    assert(block_cache_stats.count(caller_name) != 0);
+    size_t page_size = static_cast<size_t>(::getPageSize());
+    size_t required_block_size = std::max(min_memory_block_size, roundUp(new_item_size, page_size));
+    auto & stats_entry = block_cache_stats[caller_name];
+    if (stats_entry.total_memory_blocks_size + required_block_size <= stats_entry.max_total_size) 
+    {
+        auto * block = MemoryBlock::create(required_block_size);
+        MemoryBlockList memory_blocks; 
+        memory_blocks.push_back(*block);
+        Base::caches.at(caller_name).addNewMemoryBlocks(memory_blocks, cache_lock);
+        stats_entry.total_memory_blocks_size += required_block_size;
+    }
+}
+
+template <typename Key>
+void DummyRebalanceStrategy<Key>::finalize(const std::string &caller_name, MemoryBlockList memory_blocks)
+{
+    assert(block_cache_stats.count(caller_name) != 0);
+    memory_blocks.clear_and_dispose([](MemoryBlock * block) { block->destroy(); });
+    block_cache_stats[caller_name].total_memory_blocks_size = 0;
+}
+
+template <typename Key>
+size_t DummyRebalanceStrategy<Key>::getWeight() const
+{
+    size_t total_weight = 0;
+    for (const auto & item : Base::caches) {
+        const auto & block_cache = item.second;
+        total_weight += block_cache.getCacheWeight();
+    }
+    return total_weight;
+}
+
+template <typename Key>
+size_t DummyRebalanceStrategy<Key>::getCount() const
+{
+    size_t total_count = 0;
+    for (const auto & item : Base::caches) {
+        const auto & block_cache = item.second;
+        total_count += block_cache.getCacheCount();
+    }
+    return total_count;
+}
+
+template <typename Key>
+void DummyRebalanceStrategy<Key>::purge()
+{
+    for (const auto & item : block_cache_stats) 
+    {
+        const auto & name = item.first;
+        const auto & cache_stats = item.second;
+        if (cache_stats.max_size_to_evict_on_purging > 0)
+        {
+            auto blocks = Base::caches.at(name).takeMemoryBlocks(cache_stats.max_size_to_evict_on_purging);
+            size_t evicted_size = 0;
+            blocks.clear_and_dispose([&evicted_size](MemoryBlock * block) 
+            { 
+                evicted_size += block->size;
+                block->destroy(); 
+            });
+            block_cache_stats.at(name).total_memory_blocks_size -= evicted_size;
+        }
+    }
+}
+
+template <typename Key>
+void DummyRebalanceStrategy<Key>::reset()
+{
+    for (const auto & item : block_cache_stats) 
+    {
+        const auto & name = item.first;
+        const auto & cache_stats = item.second;
+        auto blocks = Base::caches.at(name).takeMemoryBlocks(cache_stats.max_total_size);
+        blocks.clear_and_dispose([](MemoryBlock * block) { block->destroy(); });
+    }
+}
+
+
+template <typename Key>
+BuddyRebalanceStrategy<Key>::BuddyRebalanceStrategy(
+    BlockCacheMapping & caches_, 
+    const BlockCacheSettingsMapping & cache_settings)
+    : Base(caches_)
+{
+    for (const auto & item : cache_settings)
+    {
+        const auto & cache_name = item.first;
+        const auto & cache_setting = item.second;
+        block_cache_stats.try_emplace(cache_name, cache_setting);
+    }
+}
+
+template <typename Key>
+MemoryBlockList BuddyRebalanceStrategy<Key>::initialize(const std::string & /*caller_name*/) 
+{
+    // nop
+    return {};
+}
+
+template <typename Key>
+void BuddyRebalanceStrategy<Key>::shouldRebalance(const std::string &/*caller_name*/, size_t /*new_item_size*/, std::lock_guard<std::mutex> &/*cache_lock*/)
+{
+}
+
+template <typename Key>
+void BuddyRebalanceStrategy<Key>::finalize(const std::string &/*caller_name*/, MemoryBlockList /*memory_blocks*/)
+{
+
+}
+
+template <typename Key>
+size_t BuddyRebalanceStrategy<Key>::getWeight() const
+{
+    size_t total_weight = 0;
+    for (const auto & item : Base::caches) {
+        const auto & block_cache = item.second;
+        total_weight += block_cache.getCacheWeight();
+    }
+    return total_weight;
+}
+
+template <typename Key>
+size_t BuddyRebalanceStrategy<Key>::getCount() const
+{
+    size_t total_count = 0;
+    for (const auto & item : Base::caches) {
+        const auto & block_cache = item.second;
+        total_count += block_cache.getCacheCount();
+    }
+    return total_count;
+}
+
+template <typename Key>
+void BuddyRebalanceStrategy<Key>::purge()
+{
+
+}
+
+template <typename Key>
+void BuddyRebalanceStrategy<Key>::reset()
+{
+
+}
+
+
+template <typename Key>
+void BlockCachesManager<Key>::initialize(
+    const std::vector<std::string> & block_cache_names,
+    std::string_view rebalance_strategy_name,
+    const BlockCacheSettingsMapping & cache_settings)
+{
+    if (rebalance_strategy_name.empty()) {
+        rebalance_strategy_name = default_rebalance_strategy;
+    } 
+    if (rebalance_strategy_name == "dummy") {
+        rebalance_strategy = std::make_shared<DummyRebalanceStrategy<Key>>(block_caches, cache_settings);
+    } else {
+        throw Exception("Invalid rebalance strategy name", ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    /// Populate block_caches mapping, the key is block_cache_name and block_cache_name with rebalance_strategy are provided in the constructor 
+    for (const auto & block_cache_name : block_cache_names)
+        block_caches.try_emplace(block_cache_name, block_cache_name, rebalance_strategy);
+}
+
+template <typename Key>
+BlockCache<Key> & BlockCachesManager<Key>::getBlockCacheInstance(const std::string & name) 
+{
+    return block_caches.at(name);
+}
+
+template <typename Key>
+size_t BlockCachesManager<Key>::getCacheWeight() const
+{
+    assert(rebalance_strategy != nullptr);
+    return rebalance_strategy->getWeight();
+} 
+
+template <typename Key>
+size_t BlockCachesManager<Key>::getCacheCount() const
+{
+    assert(rebalance_strategy != nullptr);
+    return rebalance_strategy->getCount();
+}
+
+template <typename Key>
+void BlockCachesManager<Key>::purge()
+{
+    rebalance_strategy->purge();
+}
+
+template <typename Key>
+void BlockCachesManager<Key>::reset()
+{
+    rebalance_strategy->reset();
 }
 
 
 template class BlockCache<UInt128>;
+template class DummyRebalanceStrategy<UInt128>;
+template class BlockCachesManager<UInt128>;
 
 }
