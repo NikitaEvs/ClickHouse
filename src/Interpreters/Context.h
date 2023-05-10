@@ -813,12 +813,12 @@ public:
     ThreadPool & getLoadMarksThreadpool() const;
 
     /// Create a cache of index uncompressed blocks of specified size. This can be done only once.
-    void setIndexUncompressedCache(size_t max_size_in_bytes);
+    void setIndexUncompressedCache(size_t max_size_in_bytes, const String & index_uncompressed_cache_policy);
     std::shared_ptr<UncompressedCache> getIndexUncompressedCache() const;
     void dropIndexUncompressedCache() const;
 
     /// Create a cache of index marks of specified size. This can be done only once.
-    void setIndexMarkCache(size_t cache_size_in_bytes);
+    void setIndexMarkCache(size_t cache_size_in_bytes, const String & index_mark_cache_policy);
     std::shared_ptr<MarkCache> getIndexMarkCache() const;
     void dropIndexMarkCache() const;
 

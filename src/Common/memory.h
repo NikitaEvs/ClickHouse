@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdio>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 
@@ -8,6 +9,8 @@
 #include <Common/Concepts.h>
 #include <Common/CurrentMemoryTracker.h>
 #include "config.h"
+
+#include <Common/UnifiedCache.h>
 
 #if USE_JEMALLOC
 #    include <jemalloc/jemalloc.h>
@@ -30,10 +33,21 @@ requires DB::OptionalArgument<TAlign...>
 inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
 {
     void * ptr = nullptr;
+    auto & instance = DB::BuddyArena::instance();
     if constexpr (sizeof...(TAlign) == 1)
-        ptr = aligned_alloc(alignToSizeT(align...), size);
+    {
+        if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
+            ptr = instance.malloc(size, alignToSizeT(align...));
+        else
+            ptr = aligned_alloc(alignToSizeT(align...), size);
+    } 
     else
-        ptr = malloc(size);
+    {
+        if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
+            ptr = instance.malloc(size);
+        else
+            ptr = malloc(size);
+    }
 
     if (likely(ptr != nullptr))
         return ptr;
@@ -44,17 +58,29 @@ inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
 
 inline ALWAYS_INLINE void * newNoExept(std::size_t size) noexcept
 {
-    return malloc(size);
+    auto & instance = DB::BuddyArena::instance();
+    if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
+        return instance.malloc(size);
+    else
+        return malloc(size);
 }
 
 inline ALWAYS_INLINE void * newNoExept(std::size_t size, std::align_val_t align) noexcept
 {
-    return aligned_alloc(static_cast<size_t>(align), size);
+    auto & instance = DB::BuddyArena::instance();
+    if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
+        return instance.malloc(size, static_cast<size_t>(align));
+    else 
+        return aligned_alloc(static_cast<size_t>(align), size);
 }
 
 inline ALWAYS_INLINE void deleteImpl(void * ptr) noexcept
 {
-    free(ptr);
+    auto & instance = DB::BuddyArena::instance();
+    if (instance.isValid() && instance.isAllocated(ptr))
+        instance.free(ptr);
+    else
+        free(ptr);
 }
 
 #if USE_JEMALLOC
@@ -66,10 +92,19 @@ inline ALWAYS_INLINE void deleteSized(void * ptr, std::size_t size, TAlign... al
     if (unlikely(ptr == nullptr))
         return;
 
-    if constexpr (sizeof...(TAlign) == 1)
-        sdallocx(ptr, size, MALLOCX_ALIGN(alignToSizeT(align...)));
-    else
-        sdallocx(ptr, size, 0);
+    auto & instance = DB::BuddyArena::instance();
+    if (instance.isValid() && instance.isAllocated(ptr)) 
+    {
+        instance.free(ptr);
+    }
+    else 
+    {
+        if constexpr (sizeof...(TAlign) == 1)
+            sdallocx(ptr, size, MALLOCX_ALIGN(alignToSizeT(align...)));
+        else
+            sdallocx(ptr, size, 0);
+
+    }
 }
 
 #else
@@ -122,6 +157,12 @@ template <std::same_as<std::align_val_t>... TAlign>
 requires DB::OptionalArgument<TAlign...>
 inline ALWAYS_INLINE void untrackMemory(void * ptr [[maybe_unused]], std::size_t size [[maybe_unused]] = 0, TAlign... align [[maybe_unused]]) noexcept
 {
+    auto & instance = DB::BuddyArena::instance();
+    if (instance.isValid() && instance.isAllocated(ptr))  {
+        CurrentMemoryTracker::free(size);
+        return;
+    }
+
     try
     {
 #if USE_JEMALLOC

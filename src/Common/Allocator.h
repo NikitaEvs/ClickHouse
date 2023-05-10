@@ -1,6 +1,10 @@
 #pragma once
 
 #include <cstring>
+#include <Poco/Logger.h>
+#include "Common/logger_useful.h"
+
+#include <Common/UnifiedCache.h>
 
 #ifdef NDEBUG
     #define ALLOCATOR_ASLR 0
@@ -74,30 +78,22 @@ namespace ErrorCodes
 }
 }
 
-/** Responsible for allocating / freeing memory. Used, for example, in PODArray, Arena.
-  * Also used in hash tables.
-  * The interface is different from std::allocator
-  * - the presence of the method realloc, which for large chunks of memory uses mremap;
-  * - passing the size into the `free` method;
-  * - by the presence of the `alignment` argument;
-  * - the possibility of zeroing memory (used in hash tables);
-  * - random hint address for mmap
-  * - mmap_threshold for using mmap less or more
-  */
+/// TODO: Remove BuddyAllocator replacement for the base Allocator class
+/// This is only for initial benchmarking pusposes
 template <bool clear_memory_, bool mmap_populate>
-class Allocator
+class Allocator 
 {
 public:
     /// Allocate memory range.
-    void * alloc(size_t size, size_t alignment = 0)
+    static void * alloc(size_t size, size_t alignment = 0)
     {
         checkSize(size);
-        CurrentMemoryTracker::alloc(size);
+        CurrentMemoryTracker::allocNoThrow(size);
         return allocNoTrack(size, alignment);
     }
 
     /// Free memory range.
-    void free(void * buf, size_t size)
+    static void free(void * buf, size_t size)
     {
         try
         {
@@ -107,7 +103,7 @@ public:
         }
         catch (...)
         {
-            DB::tryLogCurrentException("Allocator::free");
+            DB::tryLogCurrentException("BuddyAllocator::free");
             throw;
         }
     }
@@ -116,7 +112,7 @@ public:
       * Data from old range is moved to the beginning of new range.
       * Address of memory range could change.
       */
-    void * realloc(void * buf, size_t old_size, size_t new_size, size_t alignment = 0)
+    static void * realloc(void * buf, size_t old_size, size_t new_size, size_t alignment = 0)
     {
         checkSize(new_size);
 
@@ -125,44 +121,22 @@ public:
             /// nothing to do.
             /// BTW, it's not possible to change alignment while doing realloc.
         }
-        else if (old_size < MMAP_THRESHOLD && new_size < MMAP_THRESHOLD
-                 && alignment <= MALLOC_MIN_ALIGNMENT)
+        /// TODO: Remove hardcoded constant, only for temporary tests of base Allocator replacement
+        // else if (alignment <= MALLOC_MIN_ALIGNMENT)
+        else if (old_size < DB::UNIFIED_ALLOC_THRESHOLD && new_size < DB::UNIFIED_ALLOC_THRESHOLD 
+                 && alignment <= 8)
         {
             /// Resize malloc'd memory region with no special alignment requirement.
             CurrentMemoryTracker::realloc(old_size, new_size);
 
             void * new_buf = ::realloc(buf, new_size);
             if (nullptr == new_buf)
-                DB::throwFromErrno(fmt::format("Allocator: Cannot realloc from {} to {}.", ReadableSize(old_size), ReadableSize(new_size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot realloc from {} to {}.", ReadableSize(old_size), ReadableSize(new_size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
 
             buf = new_buf;
             if constexpr (clear_memory)
                 if (new_size > old_size)
                     memset(reinterpret_cast<char *>(buf) + old_size, 0, new_size - old_size);
-        }
-        else if (old_size >= MMAP_THRESHOLD && new_size >= MMAP_THRESHOLD)
-        {
-            /// Resize mmap'd memory region.
-            CurrentMemoryTracker::realloc(old_size, new_size);
-
-            // On apple and freebsd self-implemented mremap used (common/mremap.h)
-            buf = clickhouse_mremap(buf, old_size, new_size, MREMAP_MAYMOVE,
-                                    PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
-            if (MAP_FAILED == buf)
-                DB::throwFromErrno(fmt::format("Allocator: Cannot mremap memory chunk from {} to {}.",
-                    ReadableSize(old_size), ReadableSize(new_size)), DB::ErrorCodes::CANNOT_MREMAP);
-
-            /// No need for zero-fill, because mmap guarantees it.
-        }
-        else if (new_size < MMAP_THRESHOLD)
-        {
-            /// Small allocs that requires a copy. Assume there's enough memory in system. Call CurrentMemoryTracker once.
-            CurrentMemoryTracker::realloc(old_size, new_size);
-
-            void * new_buf = allocNoTrack(new_size, alignment);
-            memcpy(new_buf, buf, std::min(old_size, new_size));
-            freeNoTrack(buf, old_size);
-            buf = new_buf;
         }
         else
         {
@@ -185,101 +159,278 @@ protected:
 
     static constexpr bool clear_memory = clear_memory_;
 
-    // Freshly mmapped pages are copy-on-write references to a global zero page.
-    // On the first write, a page fault occurs, and an actual writable page is
-    // allocated. If we are going to use this memory soon, such as when resizing
-    // hash tables, it makes sense to pre-fault the pages by passing
-    // MAP_POPULATE to mmap(). This takes some time, but should be faster
-    // overall than having a hot loop interrupted by page faults.
-    // It is only supported on Linux.
-    static constexpr int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS
-#if defined(OS_LINUX)
-        | (mmap_populate ? MAP_POPULATE : 0)
-#endif
-        ;
-
 private:
-    void * allocNoTrack(size_t size, size_t alignment)
-    {
-        void * buf;
-        size_t mmap_min_alignment = ::getPageSize();
-
-        if (size >= MMAP_THRESHOLD)
-        {
-            if (alignment > mmap_min_alignment)
-                throw DB::Exception(fmt::format("Too large alignment {}: more than page size when allocating {}.",
-                    ReadableSize(alignment), ReadableSize(size)), DB::ErrorCodes::BAD_ARGUMENTS);
-
-            buf = mmap(getMmapHint(), size, PROT_READ | PROT_WRITE,
-                       mmap_flags, -1, 0);
-            if (MAP_FAILED == buf)
-                DB::throwFromErrno(fmt::format("Allocator: Cannot mmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
-
-            /// No need for zero-fill, because mmap guarantees it.
-        }
-        else
-        {
-            if (alignment <= MALLOC_MIN_ALIGNMENT)
-            {
-                if constexpr (clear_memory)
-                    buf = ::calloc(size, 1);
-                else
-                    buf = ::malloc(size);
-
-                if (nullptr == buf)
-                    DB::throwFromErrno(fmt::format("Allocator: Cannot malloc {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
-            }
-            else
-            {
-                buf = nullptr;
-                int res = posix_memalign(&buf, alignment, size);
-
-                if (0 != res)
-                    DB::throwFromErrno(fmt::format("Cannot allocate memory (posix_memalign) {}.", ReadableSize(size)),
-                        DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, res);
-
-                if constexpr (clear_memory)
-                    memset(buf, 0, size);
-            }
-        }
-        return buf;
-    }
-
-    void freeNoTrack(void * buf, size_t size)
-    {
-        if (size >= MMAP_THRESHOLD)
-        {
-            if (0 != munmap(buf, size))
-                DB::throwFromErrno(fmt::format("Allocator: Cannot munmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_MUNMAP);
-        }
-        else
-        {
-            ::free(buf);
-        }
-    }
-
-    void checkSize(size_t size)
+    static void checkSize(size_t size)
     {
         /// More obvious exception in case of possible overflow (instead of just "Cannot mmap").
         if (size >= 0x8000000000000000ULL)
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Too large size ({}) passed to allocator. It indicates an error.", size);
     }
 
-#ifndef NDEBUG
-    /// In debug builds, request mmap() at random addresses (a kind of ASLR), to
-    /// reproduce more memory stomping bugs. Note that Linux doesn't do it by
-    /// default. This may lead to worse TLB performance.
-    void * getMmapHint()
+    static void * allocNoTrack(size_t size, size_t alignment = 0) 
     {
-        return reinterpret_cast<void *>(std::uniform_int_distribution<intptr_t>(0x100000000000UL, 0x700000000000UL)(thread_local_rng));
+        auto & instance = DB::BuddyArena::instance();
+        void * buf = nullptr;
+
+        if (size >= DB::UNIFIED_ALLOC_THRESHOLD && instance.isValid())
+        {
+            buf = instance.malloc(size, alignment);
+
+            if (nullptr == buf)
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot allocate memory (BuddyArena) {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+
+            if constexpr (clear_memory)
+                memset(buf, 0, size);
+        }
+        else if (alignment <= MALLOC_MIN_ALIGNMENT)
+        {
+            if constexpr (clear_memory)
+                buf = ::calloc(size, 1);
+            else
+                buf = ::malloc(size);
+
+            if (nullptr == buf)
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot malloc {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+        }
+        else
+        {
+            buf = nullptr;
+            int res = posix_memalign(&buf, alignment, size);
+
+            if (0 != res)
+                DB::throwFromErrno(fmt::format("BuddyAllocator: Cannot allocate memory (posix_memalign) {}.", ReadableSize(size)),
+                    DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, res);
+
+            if constexpr (clear_memory)
+                memset(buf, 0, size);
+        }
+
+        return buf;
     }
-#else
-    void * getMmapHint()
+
+    static void freeNoTrack(void * buf, size_t /*size*/)
     {
-        return nullptr;
+        if (nullptr == buf) {
+            return;
+        }
+
+        auto & instance = DB::BuddyArena::instance();
+        if (instance.isValid() && instance.isAllocated(buf)) 
+            instance.free(buf);
+        else
+            ::free(buf);
     }
-#endif
 };
+
+/** Responsible for allocating / freeing memory. Used, for example, in PODArray, Arena.
+  * Also used in hash tables.
+  * The interface is different from std::allocator
+  * - the presence of the method realloc, which for large chunks of memory uses mremap;
+  * - passing the size into the `free` method;
+  * - by the presence of the `alignment` argument;
+  * - the possibility of zeroing memory (used in hash tables);
+  * - random hint address for mmap
+  * - mmap_threshold for using mmap less or more
+  */
+// template <bool clear_memory_, bool mmap_populate>
+// class Allocator
+// {
+// public:
+//     /// Allocate memory range.
+//     void * alloc(size_t size, size_t alignment = 0)
+//     {
+//         checkSize(size);
+//         CurrentMemoryTracker::alloc(size);
+//         return allocNoTrack(size, alignment);
+//     }
+
+//     /// Free memory range.
+//     void free(void * buf, size_t size)
+//     {
+//         try
+//         {
+//             checkSize(size);
+//             freeNoTrack(buf, size);
+//             CurrentMemoryTracker::free(size);
+//         }
+//         catch (...)
+//         {
+//             DB::tryLogCurrentException("Allocator::free");
+//             throw;
+//         }
+//     }
+
+//     /** Enlarge memory range.
+//       * Data from old range is moved to the beginning of new range.
+//       * Address of memory range could change.
+//       */
+//     void * realloc(void * buf, size_t old_size, size_t new_size, size_t alignment = 0)
+//     {
+//         checkSize(new_size);
+
+//         if (old_size == new_size)
+//         {
+//             /// nothing to do.
+//             /// BTW, it's not possible to change alignment while doing realloc.
+//         }
+//         else if (old_size < MMAP_THRESHOLD && new_size < MMAP_THRESHOLD
+//                  && alignment <= MALLOC_MIN_ALIGNMENT)
+//         {
+//             /// Resize malloc'd memory region with no special alignment requirement.
+//             CurrentMemoryTracker::realloc(old_size, new_size);
+
+//             void * new_buf = ::realloc(buf, new_size);
+//             if (nullptr == new_buf)
+//                 DB::throwFromErrno(fmt::format("Allocator: Cannot realloc from {} to {}.", ReadableSize(old_size), ReadableSize(new_size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+
+//             buf = new_buf;
+//             if constexpr (clear_memory)
+//                 if (new_size > old_size)
+//                     memset(reinterpret_cast<char *>(buf) + old_size, 0, new_size - old_size);
+//         }
+//         else if (old_size >= MMAP_THRESHOLD && new_size >= MMAP_THRESHOLD)
+//         {
+//             /// Resize mmap'd memory region.
+//             CurrentMemoryTracker::realloc(old_size, new_size);
+
+//             // On apple and freebsd self-implemented mremap used (common/mremap.h)
+//             buf = clickhouse_mremap(buf, old_size, new_size, MREMAP_MAYMOVE,
+//                                     PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
+//             if (MAP_FAILED == buf)
+//                 DB::throwFromErrno(fmt::format("Allocator: Cannot mremap memory chunk from {} to {}.",
+//                     ReadableSize(old_size), ReadableSize(new_size)), DB::ErrorCodes::CANNOT_MREMAP);
+
+//             /// No need for zero-fill, because mmap guarantees it.
+//         }
+//         else if (new_size < MMAP_THRESHOLD)
+//         {
+//             /// Small allocs that requires a copy. Assume there's enough memory in system. Call CurrentMemoryTracker once.
+//             CurrentMemoryTracker::realloc(old_size, new_size);
+
+//             void * new_buf = allocNoTrack(new_size, alignment);
+//             memcpy(new_buf, buf, std::min(old_size, new_size));
+//             freeNoTrack(buf, old_size);
+//             buf = new_buf;
+//         }
+//         else
+//         {
+//             /// Big allocs that requires a copy. MemoryTracker is called inside 'alloc', 'free' methods.
+
+//             void * new_buf = alloc(new_size, alignment);
+//             memcpy(new_buf, buf, std::min(old_size, new_size));
+//             free(buf, old_size);
+//             buf = new_buf;
+//         }
+
+//         // LOG_INFO(&Poco::Logger::get("UnifiedCache"), "Allocator: Reallocate buffer {} with old size {} and new size {} (do realloc)", buf, ReadableSize(old_size), ReadableSize(new_size));
+
+//         return buf;
+//     }
+
+// protected:
+//     static constexpr size_t getStackThreshold()
+//     {
+//         return 0;
+//     }
+
+//     static constexpr bool clear_memory = clear_memory_;
+
+//     // Freshly mmapped pages are copy-on-write references to a global zero page.
+//     // On the first write, a page fault occurs, and an actual writable page is
+//     // allocated. If we are going to use this memory soon, such as when resizing
+//     // hash tables, it makes sense to pre-fault the pages by passing
+//     // MAP_POPULATE to mmap(). This takes some time, but should be faster
+//     // overall than having a hot loop interrupted by page faults.
+//     // It is only supported on Linux.
+//     static constexpr int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS
+// #if defined(OS_LINUX)
+//         | (mmap_populate ? MAP_POPULATE : 0)
+// #endif
+//         ;
+
+// private:
+//     void * allocNoTrack(size_t size, size_t alignment)
+//     {
+//         void * buf;
+//         size_t mmap_min_alignment = ::getPageSize();
+
+//         if (size >= MMAP_THRESHOLD)
+//         {
+//             if (alignment > mmap_min_alignment)
+//                 throw DB::Exception(fmt::format("Too large alignment {}: more than page size when allocating {}.",
+//                     ReadableSize(alignment), ReadableSize(size)), DB::ErrorCodes::BAD_ARGUMENTS);
+
+//             buf = mmap(getMmapHint(), size, PROT_READ | PROT_WRITE,
+//                        mmap_flags, -1, 0);
+//             if (MAP_FAILED == buf)
+//                 DB::throwFromErrno(fmt::format("Allocator: Cannot mmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+
+//             /// No need for zero-fill, because mmap guarantees it.
+//         }
+//         else
+//         {
+//             if (alignment <= MALLOC_MIN_ALIGNMENT)
+//             {
+//                 if constexpr (clear_memory)
+//                     buf = ::calloc(size, 1);
+//                 else
+//                     buf = ::malloc(size);
+
+//                 if (nullptr == buf)
+//                     DB::throwFromErrno(fmt::format("Allocator: Cannot malloc {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+//             }
+//             else
+//             {
+//                 buf = nullptr;
+//                 int res = posix_memalign(&buf, alignment, size);
+
+//                 if (0 != res)
+//                     DB::throwFromErrno(fmt::format("Cannot allocate memory (posix_memalign) {}.", ReadableSize(size)),
+//                         DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, res);
+
+//                 if constexpr (clear_memory)
+//                     memset(buf, 0, size);
+//             }
+//         }
+//         // LOG_INFO(&Poco::Logger::get("UnifiedCache"), "Allocator: Allocate buffer {} with size {}", buf, ReadableSize(size));
+//         return buf;
+//     }
+
+//     void freeNoTrack(void * buf, size_t size)
+//     {
+//         if (size >= MMAP_THRESHOLD)
+//         {
+//             if (0 != munmap(buf, size))
+//                 DB::throwFromErrno(fmt::format("Allocator: Cannot munmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_MUNMAP);
+//         }
+//         else
+//         {
+//             ::free(buf);
+//         }
+//     }
+
+//     void checkSize(size_t size)
+//     {
+//         /// More obvious exception in case of possible overflow (instead of just "Cannot mmap").
+//         if (size >= 0x8000000000000000ULL)
+//             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Too large size ({}) passed to allocator. It indicates an error.", size);
+//     }
+
+// #ifndef NDEBUG
+//     /// In debug builds, request mmap() at random addresses (a kind of ASLR), to
+//     /// reproduce more memory stomping bugs. Note that Linux doesn't do it by
+//     /// default. This may lead to worse TLB performance.
+//     void * getMmapHint()
+//     {
+//         return reinterpret_cast<void *>(std::uniform_int_distribution<intptr_t>(0x100000000000UL, 0x700000000000UL)(thread_local_rng));
+//     }
+// #else
+//     void * getMmapHint()
+//     {
+//         return nullptr;
+//     }
+// #endif
+// };
 
 
 /** Allocator with optimization to place small memory ranges in automatic memory.

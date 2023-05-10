@@ -1762,14 +1762,14 @@ ThreadPool & Context::getLoadMarksThreadpool() const
     return *shared->load_marks_threadpool;
 }
 
-void Context::setIndexUncompressedCache(size_t max_size_in_bytes)
+void Context::setIndexUncompressedCache(size_t max_size_in_bytes, const String & index_uncompressed_cache_policy)
 {
     auto lock = getLock();
 
     if (shared->index_uncompressed_cache)
         throw Exception("Index uncompressed cache has been already created.", ErrorCodes::LOGICAL_ERROR);
 
-    shared->index_uncompressed_cache = std::make_shared<UncompressedCache>(max_size_in_bytes);
+    shared->index_uncompressed_cache = std::make_shared<UncompressedCache>(max_size_in_bytes, index_uncompressed_cache_policy);
 }
 
 
@@ -1788,14 +1788,14 @@ void Context::dropIndexUncompressedCache() const
 }
 
 
-void Context::setIndexMarkCache(size_t cache_size_in_bytes)
+void Context::setIndexMarkCache(size_t cache_size_in_bytes, const String & index_mark_cache_policy)
 {
     auto lock = getLock();
 
     if (shared->index_mark_cache)
         throw Exception("Index mark cache has been already created.", ErrorCodes::LOGICAL_ERROR);
 
-    shared->index_mark_cache = std::make_shared<MarkCache>(cache_size_in_bytes);
+    shared->index_mark_cache = std::make_shared<MarkCache>(cache_size_in_bytes, index_mark_cache_policy);
 }
 
 MarkCachePtr Context::getIndexMarkCache() const

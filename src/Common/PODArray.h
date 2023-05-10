@@ -11,6 +11,8 @@
 #include <base/strong_typedef.h>
 #include <base/getPageSize.h>
 
+#include "Common/formatReadable.h"
+#include "Common/logger_useful.h"
 #include <Common/Allocator.h>
 #include <Common/Exception.h>
 #include <Common/BitHelpers.h>
@@ -133,12 +135,19 @@ protected:
     {
         char * allocated = reinterpret_cast<char *>(TAllocator::alloc(bytes, std::forward<TAllocatorParams>(allocator_params)...));
 
+        // void * allocated_ptr = reinterpret_cast<void *>(allocated);
+        // const auto * type_name = typeid(TAllocator).name();
+        // LOG_DEBUG(&Poco::Logger::get("UnifiedCache"), "POD: Alloc {} in the {} with size {}", allocated_ptr, type_name, ReadableSize(bytes));
+
         c_start = allocated + pad_left;
         c_end = c_start;
         c_end_of_storage = allocated + bytes - pad_right;
 
         if (pad_left)
             memset(c_start - ELEMENT_SIZE, 0, ELEMENT_SIZE);
+
+        // auto * c_start_minus_pad_ptr = reinterpret_cast<void *>(c_start - pad_left);
+        // LOG_DEBUG(&Poco::Logger::get("UnifiedCache"), "POD: alloc in the {} c_start - pad_left = {}", type_name, c_start_minus_pad_ptr);
     }
 
     void dealloc()
@@ -147,6 +156,10 @@ protected:
             return;
 
         unprotect();
+
+        // void * dealloc_ptr = reinterpret_cast<void *>(c_start - pad_left);
+        // const auto * type_name = typeid(TAllocator).name();
+        // LOG_DEBUG(&Poco::Logger::get("UnifiedCache"), "POD: Dealloc {} in the {}", dealloc_ptr, type_name);
 
         TAllocator::free(c_start - pad_left, allocated_bytes());
     }
@@ -166,10 +179,17 @@ protected:
 
         char * allocated = reinterpret_cast<char *>(
             TAllocator::realloc(c_start - pad_left, allocated_bytes(), bytes, std::forward<TAllocatorParams>(allocator_params)...));
+            
+        // void * realloc_ptr = reinterpret_cast<void *>(allocated);
+        // const auto * type_name = typeid(TAllocator).name();
+        // LOG_DEBUG(&Poco::Logger::get("UnifiedCache"), "POD: Realloc {} in the {} with size {} and new size {}", realloc_ptr, type_name, ReadableSize(bytes), ReadableSize(allocated_bytes()));
 
         c_start = allocated + pad_left;
         c_end = c_start + end_diff;
         c_end_of_storage = allocated + bytes - pad_right;
+
+        // auto * c_start_minus_pad_ptr = reinterpret_cast<void *>(c_start - pad_left);
+        // LOG_DEBUG(&Poco::Logger::get("UnifiedCache"), "POD: realloc in the {} c_start - pad_left = {}", type_name, c_start_minus_pad_ptr);
     }
 
     bool isInitialized() const
