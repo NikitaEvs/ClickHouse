@@ -802,23 +802,23 @@ public:
     void setSystemZooKeeperLogAfterInitializationIfNeeded();
 
     /// Create a cache of uncompressed blocks of specified size. This can be done only once.
-    void setUncompressedCache(size_t max_size_in_bytes, const String & uncompressed_cache_policy);
+    void setUncompressedCache(const String & block_cache_name);
     std::shared_ptr<UncompressedCache> getUncompressedCache() const;
     void dropUncompressedCache() const;
 
     /// Create a cache of marks of specified size. This can be done only once.
-    void setMarkCache(size_t cache_size_in_bytes, const String & mark_cache_policy);
+    void setMarkCache(const String & block_cache_name);
     std::shared_ptr<MarkCache> getMarkCache() const;
     void dropMarkCache() const;
     ThreadPool & getLoadMarksThreadpool() const;
 
     /// Create a cache of index uncompressed blocks of specified size. This can be done only once.
-    void setIndexUncompressedCache(size_t max_size_in_bytes);
+    void setIndexUncompressedCache(const String & block_cache_name);
     std::shared_ptr<UncompressedCache> getIndexUncompressedCache() const;
     void dropIndexUncompressedCache() const;
 
     /// Create a cache of index marks of specified size. This can be done only once.
-    void setIndexMarkCache(size_t cache_size_in_bytes);
+    void setIndexMarkCache(const String & block_cache_name);
     std::shared_ptr<MarkCache> getIndexMarkCache() const;
     void dropIndexMarkCache() const;
 

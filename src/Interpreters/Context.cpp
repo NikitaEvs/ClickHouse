@@ -1701,14 +1701,14 @@ ProcessList::Element * Context::getProcessListElement() const
 }
 
 
-void Context::setUncompressedCache(size_t max_size_in_bytes, const String & uncompressed_cache_policy)
+void Context::setUncompressedCache(const String & block_cache_name)
 {
     auto lock = getLock();
 
     if (shared->uncompressed_cache)
         throw Exception("Uncompressed cache has been already created.", ErrorCodes::LOGICAL_ERROR);
 
-    shared->uncompressed_cache = std::make_shared<UncompressedCache>(max_size_in_bytes, uncompressed_cache_policy);
+    shared->uncompressed_cache = std::make_shared<UncompressedCache>(block_cache_name);
 }
 
 
@@ -1727,14 +1727,14 @@ void Context::dropUncompressedCache() const
 }
 
 
-void Context::setMarkCache(size_t cache_size_in_bytes, const String & mark_cache_policy)
+void Context::setMarkCache(const String & block_cache_name)
 {
     auto lock = getLock();
 
     if (shared->mark_cache)
         throw Exception("Mark cache has been already created.", ErrorCodes::LOGICAL_ERROR);
 
-    shared->mark_cache = std::make_shared<MarkCache>(cache_size_in_bytes, mark_cache_policy);
+    shared->mark_cache = std::make_shared<MarkCache>(block_cache_name);
 }
 
 MarkCachePtr Context::getMarkCache() const
@@ -1762,14 +1762,14 @@ ThreadPool & Context::getLoadMarksThreadpool() const
     return *shared->load_marks_threadpool;
 }
 
-void Context::setIndexUncompressedCache(size_t max_size_in_bytes)
+void Context::setIndexUncompressedCache(const String & block_cache_name)
 {
     auto lock = getLock();
 
     if (shared->index_uncompressed_cache)
         throw Exception("Index uncompressed cache has been already created.", ErrorCodes::LOGICAL_ERROR);
 
-    shared->index_uncompressed_cache = std::make_shared<UncompressedCache>(max_size_in_bytes);
+    shared->index_uncompressed_cache = std::make_shared<UncompressedCache>(block_cache_name);
 }
 
 
@@ -1788,14 +1788,14 @@ void Context::dropIndexUncompressedCache() const
 }
 
 
-void Context::setIndexMarkCache(size_t cache_size_in_bytes)
+void Context::setIndexMarkCache(const String & block_cache_name)
 {
     auto lock = getLock();
 
     if (shared->index_mark_cache)
         throw Exception("Index mark cache has been already created.", ErrorCodes::LOGICAL_ERROR);
 
-    shared->index_mark_cache = std::make_shared<MarkCache>(cache_size_in_bytes);
+    shared->index_mark_cache = std::make_shared<MarkCache>(block_cache_name);
 }
 
 MarkCachePtr Context::getIndexMarkCache() const
