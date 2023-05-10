@@ -1397,8 +1397,16 @@ int Server::main(const std::vector<std::string> & /*args*/)
     /// Set up caches.
     auto block_cache_size = 1000_MiB;
     auto max_size_to_evict_on_purging = 300_MiB;
-    auto & block_cache = DB::GlobalBlockCache<UInt128>::instance();
-    block_cache.initialize(block_cache_size, max_size_to_evict_on_purging);
+    auto & block_cache_manager = DB::BlockCachesManager<UInt128>::instance();
+    // std::vector<std::string> block_cache_names = {"global"};
+    std::vector<std::string> block_cache_names = {"marks", "uncompressed"};
+    std::string rebalance_strategy_name = "dummy";
+    BlockCacheSettingsMapping cache_settings;
+    // cache_settings["global"] = {.cache_max_size = block_cache_size, .max_size_to_evict_on_purging = max_size_to_evict_on_purging};
+    cache_settings["marks"] = {.cache_max_size = block_cache_size, .max_size_to_evict_on_purging = max_size_to_evict_on_purging};
+    cache_settings["uncompressed"] = {.cache_max_size = block_cache_size, .max_size_to_evict_on_purging = max_size_to_evict_on_purging};
+
+    block_cache_manager.initialize(block_cache_names, rebalance_strategy_name, cache_settings);
 
     /// Lower cache size on low-memory systems.
     double cache_size_to_ram_max_ratio = config().getDouble("cache_size_to_ram_max_ratio", 0.5);
@@ -1414,7 +1422,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
         LOG_INFO(log, "Uncompressed cache size was lowered to {} because the system has low amount of memory",
             formatReadableSizeWithBinarySuffix(uncompressed_cache_size));
     }
-    global_context->setUncompressedCache(uncompressed_cache_size, uncompressed_cache_policy);
+    global_context->setUncompressedCache("uncompressed");
 
     /// Load global settings from default_profile and system_profile.
     global_context->setDefaultProfiles(config());
@@ -1441,17 +1449,17 @@ int Server::main(const std::vector<std::string> & /*args*/)
         LOG_INFO(log, "Mark cache size was lowered to {} because the system has low amount of memory",
             formatReadableSizeWithBinarySuffix(mark_cache_size));
     }
-    global_context->setMarkCache(mark_cache_size, mark_cache_policy);
+    global_context->setMarkCache("marks");
 
     /// Size of cache for uncompressed blocks of MergeTree indices. Zero means disabled.
     size_t index_uncompressed_cache_size = config().getUInt64("index_uncompressed_cache_size", 0);
     if (index_uncompressed_cache_size)
-        global_context->setIndexUncompressedCache(index_uncompressed_cache_size);
+        global_context->setIndexUncompressedCache("uncompressed");
 
     /// Size of cache for index marks (index of MergeTree skip indices).
     size_t index_mark_cache_size = config().getUInt64("index_mark_cache_size", 0);
     if (index_mark_cache_size)
-        global_context->setIndexMarkCache(index_mark_cache_size);
+        global_context->setIndexMarkCache("marks");
 
     /// A cache for mmapped files.
     size_t mmap_cache_size = config().getUInt64("mmap_cache_size", 1000);   /// The choice of default is arbitrary.

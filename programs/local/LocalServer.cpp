@@ -23,6 +23,7 @@
 #include <Common/TLDListsHolder.h>
 #include <Common/quoteString.h>
 #include <Common/randomSeed.h>
+#include <Common/UnifiedCache.h>
 #include <Loggers/Loggers.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromString.h>
@@ -559,27 +560,42 @@ void LocalServer::processConfig()
     /// There is no need for concurrent queries, override max_concurrent_queries.
     global_context->getProcessList().setMaxSize(0);
 
+    /// Set up caches.
+    auto block_cache_size = 1000_MiB;
+    auto max_size_to_evict_on_purging = 300_MiB;
+    auto & block_cache_manager = DB::BlockCachesManager<UInt128>::instance();
+    std::vector<std::string> block_cache_names = {"global"};
+    std::string rebalance_strategy_name = "dummy";
+    BlockCacheSettingsMapping cache_settings;
+    cache_settings["global"] = {.cache_max_size = block_cache_size, .max_size_to_evict_on_purging = max_size_to_evict_on_purging};
+
+    block_cache_manager.initialize(block_cache_names, rebalance_strategy_name, cache_settings);
+
     /// Size of cache for uncompressed blocks. Zero means disabled.
     String uncompressed_cache_policy = config().getString("uncompressed_cache_policy", "");
     size_t uncompressed_cache_size = config().getUInt64("uncompressed_cache_size", 0);
     if (uncompressed_cache_size)
-        global_context->setUncompressedCache(uncompressed_cache_size, uncompressed_cache_policy);
+        global_context->setUncompressedCache("global");
+        // global_context->setUncompressedCache(uncompressed_cache_size, uncompressed_cache_policy);
 
     /// Size of cache for marks (index of MergeTree family of tables).
     String mark_cache_policy = config().getString("mark_cache_policy", "");
     size_t mark_cache_size = config().getUInt64("mark_cache_size", 5368709120);
     if (mark_cache_size)
-        global_context->setMarkCache(mark_cache_size, mark_cache_policy);
+        global_context->setMarkCache("global");
+        // global_context->setMarkCache(mark_cache_size, mark_cache_policy);
 
     /// Size of cache for uncompressed blocks of MergeTree indices. Zero means disabled.
     size_t index_uncompressed_cache_size = config().getUInt64("index_uncompressed_cache_size", 0);
     if (index_uncompressed_cache_size)
-        global_context->setIndexUncompressedCache(index_uncompressed_cache_size);
+        global_context->setIndexUncompressedCache("global");
+        // global_context->setIndexUncompressedCache(index_uncompressed_cache_size);
 
     /// Size of cache for index marks (index of MergeTree skip indices).
     size_t index_mark_cache_size = config().getUInt64("index_mark_cache_size", 0);
     if (index_mark_cache_size)
-        global_context->setIndexMarkCache(index_mark_cache_size);
+        global_context->setIndexMarkCache("global");
+        // global_context->setIndexMarkCache(index_mark_cache_size);
 
     /// A cache for mmapped files.
     size_t mmap_cache_size = config().getUInt64("mmap_cache_size", 1000);   /// The choice of default is arbitrary.
