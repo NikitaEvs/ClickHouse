@@ -11,6 +11,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/typeid_cast.h>
 #include <Common/filesystemHelpers.h>
+#include <Common/UnifiedCache.h>
 #include <Interpreters/Cache/FileCacheFactory.h>
 #include <Common/getCurrentProcessFDCount.h>
 #include <Common/getMaxFileDescriptorCount.h>
@@ -623,18 +624,15 @@ void AsynchronousMetrics::update(TimePoint update_time)
     // Temporary add cache tracking
     // TODO: Remove
     {
-        auto & unified_cache= GlobalBlockCache<UInt128>::instance();
-        if (unified_cache.isValid())
-        {
-            const auto unified_cache_weight = unified_cache.getCacheWeight();
-            const auto unified_cache_count = unified_cache.getCacheCount();
-            new_values["UnifiedCacheBytes"] = unified_cache_weight;
-            new_values["UnifiedCacheCount"] = unified_cache_count;
-            LOG_TRACE(log,
-                "UnifiedCacheTracking: weight is {}, count is {}",
-                ReadableSize(unified_cache_weight),
-                unified_cache_count);
-        }
+        auto & unified_cache = BlockCachesManager<UInt128>::instance();
+        const auto unified_cache_weight = unified_cache.getCacheWeight();
+        const auto unified_cache_count = unified_cache.getCacheCount();
+        new_values["UnifiedCacheBytes"] = unified_cache_weight;
+        new_values["UnifiedCacheCount"] = unified_cache_count;
+        LOG_TRACE(log,
+            "UnifiedCacheTracking: weight is {}, count is {}",
+            ReadableSize(unified_cache_weight),
+            unified_cache_count);
     }
 
 #if USE_ROCKSDB
