@@ -242,7 +242,7 @@ void MemoryTracker::allocImpl(Int64 size, bool throw_if_memory_exceeded, MemoryT
     /// TODO: Rewrite with a rebalance strategy
     if (unlikely(current_limit_to_purge_cache && will_be > current_limit_to_purge_cache))
     {
-        auto & cache_instance = DB::GlobalBlockCache<UInt128>::instance();
+        auto & cache_instance = DB::BlockCachesManager<UInt128>::instance();
         /// TODO: Make a better shrinkage with a relative ration to the full amount of memory
         cache_instance.purge();
     }
