@@ -561,15 +561,42 @@ void LocalServer::processConfig()
     global_context->getProcessList().setMaxSize(0);
 
     /// Set up caches.
-    auto block_cache_size = 1000_MiB;
-    auto max_size_to_evict_on_purging = 300_MiB;
-    auto & block_cache_manager = DB::BlockCachesManager<UInt128>::instance();
-    std::vector<std::string> block_cache_names = {"global"};
-    std::string rebalance_strategy_name = "dummy";
-    BlockCacheSettingsMapping cache_settings;
-    cache_settings["global"] = {.cache_max_size = block_cache_size, .max_size_to_evict_on_purging = max_size_to_evict_on_purging};
 
-    block_cache_manager.initialize(block_cache_names, rebalance_strategy_name, cache_settings);
+    /// Dummy strategy
+    // auto block_cache_size = 1000_MiB;
+    // auto max_size_to_evict_on_purging = 300_MiB;
+    // std::string rebalance_strategy_name = "dummy";
+    // RebalanceStrategySettings rebalance_strategy_settings;
+    // rebalance_strategy_settings.setBlockCacheSetting("max_total_size", "marks", Field(block_cache_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_total_size", "uncompressed", Field(block_cache_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    /// Buddy static strategy
+    // auto memory_arena_size = 4_GiB;
+    // auto max_size_to_evict_on_purging = 300_MiB;
+    // std::string rebalance_strategy_name = "buddy_static";
+    // RebalanceStrategySettings rebalance_strategy_settings;
+    // rebalance_strategy_settings.set("memory_arena_size", Field(memory_arena_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    /// Buddy dynamic strategy
+    auto memory_arena_capacity = 4_GiB;
+    auto memory_arena_initial_size = 128_MiB;
+    size_t allocated_memory_multiplier = 2;
+    auto max_size_to_evict_on_purging = 300_MiB;
+    std::string rebalance_strategy_name = "buddy_dynamic";
+    RebalanceStrategySettings rebalance_strategy_settings;
+    rebalance_strategy_settings.set("memory_arena_capacity", Field(memory_arena_capacity));
+    rebalance_strategy_settings.set("memory_arena_initial_size", Field(memory_arena_initial_size));
+    rebalance_strategy_settings.set("allocated_memory_multiplier", Field(allocated_memory_multiplier));
+    rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    auto & block_cache_manager = DB::BlockCachesManager<UInt128>::instance();
+    std::vector<std::string> block_cache_names = {"marks", "uncompressed"};
+    block_cache_manager.initialize(block_cache_names, rebalance_strategy_name, rebalance_strategy_settings);
 
     /// Size of cache for uncompressed blocks. Zero means disabled.
     String uncompressed_cache_policy = config().getString("uncompressed_cache_policy", "");

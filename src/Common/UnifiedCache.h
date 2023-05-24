@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Common/ArrayCache.h>
+#include "Core/Field.h"
 #include <Core/Block.h>
 #include <Core/Types.h>
 #include <Interpreters/Context.h>
@@ -18,7 +19,148 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_ALLOCATE_MEMORY;
+    extern const int CANNOT_MUNMAP;
 }
+
+
+/// Global memory arena under buddy allocator schema
+class BuddyArena
+{
+public:
+    union MemoryBlock;
+
+    /// Node of double-linked list
+    struct FreeMemoryBlock 
+    {
+        MemoryBlock * previous;
+        MemoryBlock * next;
+    };
+
+    union MemoryBlock 
+    {
+        FreeMemoryBlock pointers;
+        char data[0];
+    };
+
+    static BuddyArena & instance()
+    {
+        static BuddyArena arena;
+        return arena;    
+    }
+
+    BuddyArena() = default;
+
+    ~BuddyArena() noexcept;
+
+    BuddyArena(const BuddyArena&) = delete;
+    BuddyArena(BuddyArena&&) = delete;
+    BuddyArena& operator=(const BuddyArena&) = delete;
+    BuddyArena& operator=(BuddyArena&&) = delete;
+
+    bool isValid() const;
+
+    /// Check that the ptr is contained in the allocated memory arena
+    bool isAllocated(const void * ptr) const;
+
+    void initialize(size_t minimal_allocation_size, size_t size, size_t capacity);
+
+    void * malloc(size_t size, size_t align = 0);
+    void free(void * buf) noexcept;
+
+    void purge();
+
+    [[nodiscard]] double getFreeSpaceRatio() const;
+    [[nodiscard]] size_t getTotalSizeBytes() const;
+
+private:
+    static constexpr size_t kPageSize = 4096;
+
+    void * arena_buffer;
+
+    size_t number_of_levels = 0;
+    size_t total_size_bytes = 0;
+
+    size_t minimal_allocation_size_bytes = 0;
+
+    std::atomic<size_t> free_min_blocks = 0;
+    size_t min_blocks_num = 0;
+
+    /// Meta storage 
+
+    /// TODO: Compact block_status and pointers_levels
+    enum class BlockStatus : uint8_t {
+        NotInLists = 0,
+        InFreeLists = 1,
+        InShadowLists = 2,
+    };
+    BlockStatus * block_status;
+
+    uint8_t * pointers_levels;
+    struct GuardedLists {
+        MemoryBlock ** lists;
+        std::mutex * mutexes;
+        BlockStatus lists_block_status;
+    };
+    GuardedLists free_lists{.lists_block_status = BlockStatus::InFreeLists};
+    GuardedLists shadow_lists{.lists_block_status = BlockStatus::InShadowLists};
+
+    [[nodiscard]] static void * allocateArena(size_t size); 
+    static void deallocateArena(void * buffer, size_t size);
+
+    size_t calculateLevel(size_t size) const; 
+    size_t calculateLevel(size_t size, size_t align) const;
+    size_t calculateBlockSizeOnLevel(size_t level) const;
+    size_t calculateIndexInLevel(const MemoryBlock * block, size_t level) const; 
+    size_t calculateIndex(const MemoryBlock * block, size_t level) const; 
+    size_t calculatePointerIndex(const MemoryBlock * block) const;
+
+    /// Calculate number of minimal blocks for the allocation on the lower level
+    /// Used to calculate offset for the meta storage beforehand
+    size_t calculateMinBlocksNumber(size_t size_bytes) const;
+
+    MemoryBlock * blockFromIndexInLevel(size_t index_in_level, size_t level) const;
+
+    size_t getPointerLevel(const MemoryBlock * block) const;
+    void setPointerLevel(const MemoryBlock * block, size_t level); 
+
+    MemoryBlock * takeBlockFromLists(GuardedLists & guarded_lists, size_t level); 
+    void returnBlockToLists(GuardedLists & guarded_lists, MemoryBlock * block, size_t level);
+
+    /// Take the block from free_lists 
+    MemoryBlock * allocateBlock(size_t level); 
+    /// Return the block to the free_lists
+    void deallocateBlock(MemoryBlock * block, size_t level); 
+
+    bool adviseBlock(MemoryBlock * block, size_t level) const;
+    void reclaimBlock(MemoryBlock * block, size_t level) const;
+
+    /// Take the block from the shadow_lists, trigger page mapping on the block
+    MemoryBlock * acquireBlock(size_t level);
+    /// Try to return the block to the shadow_lists and advise the memory block. Will fail, if madvice fails
+    void tryReleaseBlock(MemoryBlock * block, size_t level);
+
+    char * initializeMetaStorage(); 
+
+    std::pair<MemoryBlock *, MemoryBlock *> divideBlock(MemoryBlock * block, size_t level); 
+    static MemoryBlock * mergeWithBuddy(MemoryBlock * block, MemoryBlock * buddy);
+    MemoryBlock * getBuddy(MemoryBlock * block, size_t level) const; 
+
+    BlockStatus getBlockStatus(const MemoryBlock * block, size_t level) const;
+    void setBlockStatus(const MemoryBlock * block, size_t level, BlockStatus status);
+
+    /// TODO: Remove this method
+    /// Temporarly use only
+    void printMemoryUsageDummy() const; 
+
+    static void addToList(MemoryBlock ** lists, MemoryBlock * block, size_t level);
+    static bool isListEmpty(MemoryBlock ** lists, size_t level); 
+    static void removeFromList(MemoryBlock ** lists, MemoryBlock * block, size_t level);
+
+    void addToFreeList(MemoryBlock * block, size_t level);
+    bool isFreeListEmpty(size_t level) const; 
+    void removeFromFreeList(MemoryBlock * block, size_t level);
+};
 
 
 template <typename Key>
@@ -31,6 +173,7 @@ struct MemoryBlock : public MemoryBlockListHook, private boost::noncopyable
 {
     void * ptr;
     size_t size;
+    bool is_owner;
 
     MemoryBlock(MemoryBlock && other) noexcept : ptr(other.ptr), size(other.size)
     {
@@ -42,12 +185,19 @@ struct MemoryBlock : public MemoryBlockListHook, private boost::noncopyable
         return new MemoryBlock(size_);
     }
 
+    static MemoryBlock * create(void * ptr_, size_t size_)
+    {
+        return new MemoryBlock(ptr_, size_);
+    }
+
     void destroy()
     {
         delete this;
     }
 private:
     explicit MemoryBlock(size_t size_);
+    MemoryBlock(void * ptr_, size_t size_);
+
     ~MemoryBlock();
 };
 using MemoryBlockList = boost::intrusive::list<MemoryBlock,
@@ -187,7 +337,7 @@ private:
     /// Precondition: free_region.size >= size.
     RegionMetadata * allocateFromFreeRegion(RegionMetadata * free_region, size_t size, std::lock_guard<std::mutex> & cache_lock);
 
-    RegionMetadata * allocate(size_t size, std::lock_guard<std::mutex> & cache_lock);
+    RegionMetadata * allocate(size_t size);
 
     /// Precondition: region is not in lru_list, not in key_map, not in size_multimap.
     /// Postcondition: region is not in lru_list, not in key_map,
@@ -202,7 +352,8 @@ private:
     /// Region is removed from lru_list and key_map and inserted into size_multimap.
     RegionMetadata * evictSome(size_t requested_size, std::lock_guard<std::mutex> & cache_lock) noexcept;
 
-    // void shrink(size_t max_size_to_evict);
+    /// Evicting regions from cache until requested_size is evicted or cache is empty
+    RegionMetadata * evict(size_t requested_size, std::lock_guard<std::mutex> & cache_lock) noexcept;
 
 public:
     struct Holder : private boost::noncopyable
@@ -245,7 +396,7 @@ public:
     {
         /// TODO: Remove temp hack, add single-flight system
         std::lock_guard get_or_set_lock(get_or_set_mutex);
-        RegionMetadata * region;
+
         {
             std::lock_guard cache_lock(mutex);
 
@@ -256,15 +407,16 @@ public:
                     *was_calculated = false;
                 return new Holder(*this, *it, cache_lock);
             }
-
-            size_t size = get_size();
-            region = allocate(size, cache_lock);
-
-            if (!region) 
-                return {};
-
-            region->key = key;
         }
+
+        RegionMetadata * region;
+        size_t size = get_size();
+        region = allocate(size);
+
+        if (!region)
+            return {};
+
+        region->key = key;
 
         try
         {
@@ -305,7 +457,26 @@ public:
 };
 
 
+class RebalanceStrategySettings
+{
+public:
+    void set(const std::string & key, const Field & field);
+    void setBlockCacheSetting(const std::string & key, const std::string & block_cache_name, const Field & field);
+    
+    bool tryGet(const std::string & key, Field & field) const;
+    bool tryGetBlockCacheSetting(const std::string & key, const std::string & block_cache_name, Field & field) const;
+
+private:
+    using SettingsMapping = std::unordered_map<std::string, Field>;
+    using BlockCacheSettingsMapping = std::unordered_map<std::string, SettingsMapping>;
+
+    SettingsMapping rebalance_strategy_settings;
+    BlockCacheSettingsMapping block_caches_settings;    
+};
+
+
 /// Lifetime of the IRebalanceStrategy is the same as the lifetime of the BlockCachesManager
+/// TODO: Change ownership of the IRebalanceStrategy in the BlockCache from the shared_ptr to the weak_ptr
 template <typename Key>
 class IRebalanceStrategy 
 {
@@ -316,12 +487,21 @@ public:
 
     virtual ~IRebalanceStrategy() = default;
 
+    /// Non-copyable
+    IRebalanceStrategy(const IRebalanceStrategy &) = delete;
+    IRebalanceStrategy & operator=(const IRebalanceStrategy &) = delete;
+
+    /// Movable
+    IRebalanceStrategy(IRebalanceStrategy &&) noexcept = default;
+    IRebalanceStrategy & operator=(IRebalanceStrategy &&) noexcept = default;
+
     /// Interfaces for the BlockCache
     virtual MemoryBlockList initialize(const std::string & caller_name) = 0;
-    virtual void shouldRebalance(const std::string & caller_name, size_t new_item_size, std::lock_guard<std::mutex> & cache_lock) = 0;
+    virtual void shouldRebalance(const std::string & caller_name, size_t new_item_size) = 0;
     virtual void finalize(const std::string & caller_name, MemoryBlockList memory_blocks) = 0;
 
     /// Interfaces for the BlockCacheManager
+    virtual void initializeWithSettings(const RebalanceStrategySettings & settings_) = 0;
     virtual size_t getWeight() const = 0;
     virtual size_t getCount() const = 0;
     virtual void purge() = 0;
@@ -330,14 +510,6 @@ public:
 protected:
     BlockCacheMapping & caches;
 };
-
-
-struct BlockCacheSettings
-{
-    size_t cache_max_size;
-    size_t max_size_to_evict_on_purging;
-};
-using BlockCacheSettingsMapping = std::unordered_map<std::string, BlockCacheSettings>;
 
 
 template <typename Key>
@@ -350,26 +522,42 @@ class DummyRebalanceStrategy : public IRebalanceStrategy<Key>
 public:
     struct BlockCacheStats 
     {
-        size_t total_memory_blocks_size = 0;
-        size_t max_total_size = 0;
-        size_t max_size_to_evict_on_purging = 0;
-
-        explicit BlockCacheStats(const BlockCacheSettings & settings)
-            : max_total_size(settings.cache_max_size)
-            , max_size_to_evict_on_purging(settings.max_size_to_evict_on_purging)
-        {}
+        std::atomic<size_t> total_memory_blocks_size = 0;
 
         BlockCacheStats() = default;
     };
     using BlockCacheStatsMapping = std::unordered_map<std::string, BlockCacheStats>;
 
-    DummyRebalanceStrategy(BlockCacheMapping & caches_, const BlockCacheSettingsMapping & cache_settings);
+    struct BlockCacheSettings
+    {
+        const size_t max_total_size = 0;
+        const size_t max_size_to_evict_on_purging = 0;
+
+        BlockCacheSettings(size_t max_total_size_, size_t max_size_to_evict_on_purging_)
+            : max_total_size(max_total_size_)
+            , max_size_to_evict_on_purging(max_size_to_evict_on_purging_)
+        {}
+    };
+    using BlockCacheSettingsMapping = std::unordered_map<std::string, BlockCacheSettings>;
+
+    struct Settings
+    {
+        BlockCacheSettingsMapping block_cache_settings;
+
+        /// We will allocate memory in blocks of at least that size.
+        /// 64 MB makes mmap overhead comparable to memory throughput.
+        static constexpr size_t min_memory_block_size = 64 * 1024 * 1024;
+    };
+
+    DummyRebalanceStrategy(BlockCacheMapping & caches_, const std::vector<std::string> & block_cache_names);
 
     MemoryBlockList initialize(const std::string & caller_name) final;
 
-    void shouldRebalance(const std::string & caller_name, size_t new_item_size, std::lock_guard<std::mutex> & cache_lock) final;
+    void shouldRebalance(const std::string & caller_name, size_t new_item_size) final;
 
     void finalize(const std::string & caller_name, MemoryBlockList memory_blocks) final;
+
+    void initializeWithSettings(const RebalanceStrategySettings & settings_) final;
 
     /// Get a size of the useful data in the cache
     /// Note: can return out-of-thin-air values for the sum of cache weights
@@ -386,11 +574,11 @@ public:
     void reset() final;
 
 private:
+    std::vector<std::string> block_cache_names;
     BlockCacheStatsMapping block_cache_stats;
+    Settings settings;
 
-    /// We will allocate memory in blocks of at least that size.
-    /// 64 MB makes mmap overhead comparable to memory throughput.
-    static constexpr size_t min_memory_block_size = 64 * 1024 * 1024;
+    void shrinkBlockCaches(bool use_limit);
 
     static size_t roundUp(size_t x, size_t rounding)
     {
@@ -400,7 +588,7 @@ private:
 
 
 template <typename Key>
-class BuddyRebalanceStrategy : public IRebalanceStrategy<Key>
+class BuddyStaticRebalanceStrategy : public IRebalanceStrategy<Key>
 {
     using Base = IRebalanceStrategy<Key>;
     using BlockCacheMapping = typename IRebalanceStrategy<Key>::BlockCacheMapping;
@@ -409,26 +597,39 @@ class BuddyRebalanceStrategy : public IRebalanceStrategy<Key>
 public:
     struct BlockCacheStats 
     {
-        size_t total_memory_blocks_size = 0;
-        size_t max_total_size = 0;
-        size_t max_size_to_evict_on_purging = 0;
-
-        explicit BlockCacheStats(const BlockCacheSettings & settings)
-            : max_total_size(settings.cache_max_size)
-            , max_size_to_evict_on_purging(settings.max_size_to_evict_on_purging)
-        {}
+        std::atomic<size_t> total_memory_blocks_size = 0;
 
         BlockCacheStats() = default;
     };
     using BlockCacheStatsMapping = std::unordered_map<std::string, BlockCacheStats>;
 
-    BuddyRebalanceStrategy(BlockCacheMapping & caches_, const BlockCacheSettingsMapping & cache_settings);
+    struct BlockCacheSettings
+    {
+        const size_t max_size_to_evict_on_purging = 0;
+
+        explicit BlockCacheSettings(size_t max_size_to_evict_on_purging_)
+            : max_size_to_evict_on_purging(max_size_to_evict_on_purging_)
+        {}
+    };
+    using BlockCacheSettingsMapping = std::unordered_map<std::string, BlockCacheSettings>;
+
+    struct Settings
+    {
+        BlockCacheSettingsMapping block_cache_settings;
+        size_t memory_arena_size = 0;
+
+        static constexpr size_t minimal_allocation_size = 4096;
+    };
+
+    BuddyStaticRebalanceStrategy(BlockCacheMapping & caches_, const std::vector<std::string> & block_cache_names_);
 
     MemoryBlockList initialize(const std::string & caller_name) final;
 
-    void shouldRebalance(const std::string & caller_name, size_t new_item_size, std::lock_guard<std::mutex> & cache_lock) final;
+    void shouldRebalance(const std::string & caller_name, size_t new_item_size) final;
 
     void finalize(const std::string & caller_name, MemoryBlockList memory_blocks) final;
+
+    void initializeWithSettings(const RebalanceStrategySettings & settings_) final;
 
     /// Get a size of the useful data in the cache
     /// Note: can return out-of-thin-air values for the sum of cache weights
@@ -445,7 +646,100 @@ public:
     void reset() final;
 
 private:
+    std::vector<std::string> block_cache_names;
     BlockCacheStatsMapping block_cache_stats;
+    BuddyArena memory_arena;
+    Settings settings;
+
+    void shrinkBlockCaches(bool use_limit);
+
+    size_t roundUpToPowerOf2(size_t x, size_t min_result)
+    {
+        size_t power = min_result;
+        while (power < x)
+            power *= 2;
+        return power;
+    }
+};
+
+
+template <typename Key>
+class BuddyDynamicRebalanceStrategy : public IRebalanceStrategy<Key>
+{
+    using Base = IRebalanceStrategy<Key>;
+    using BlockCacheMapping = typename IRebalanceStrategy<Key>::BlockCacheMapping;
+    using BlockCache = BlockCache<Key>;
+
+public:
+    struct BlockCacheStats 
+    {
+        std::atomic<size_t> total_memory_blocks_size = 0;
+
+        BlockCacheStats() = default;
+    };
+    using BlockCacheStatsMapping = std::unordered_map<std::string, BlockCacheStats>;
+
+    struct BlockCacheSettings
+    {
+        const size_t max_size_to_evict_on_purging = 0;
+
+        explicit BlockCacheSettings(size_t max_size_to_evict_on_purging_)
+            : max_size_to_evict_on_purging(max_size_to_evict_on_purging_)
+        {}
+    };
+    using BlockCacheSettingsMapping = std::unordered_map<std::string, BlockCacheSettings>;
+
+    struct Settings
+    {
+        BlockCacheSettingsMapping block_cache_settings;
+        size_t memory_arena_capacity = 0;
+        size_t memory_arena_initial_size = 0;
+        size_t allocated_memory_multiplier = 1;
+
+        static constexpr size_t minimal_allocation_size = 4096;
+    };
+
+    BuddyDynamicRebalanceStrategy(BlockCacheMapping & caches_, const std::vector<std::string> & block_cache_names_);
+
+    MemoryBlockList initialize(const std::string & caller_name) final;
+
+    void shouldRebalance(const std::string & caller_name, size_t new_item_size) final;
+
+    void finalize(const std::string & caller_name, MemoryBlockList memory_blocks) final;
+
+    void initializeWithSettings(const RebalanceStrategySettings & settings_) final;
+
+    /// Get a size of the useful data in the cache
+    /// Note: can return out-of-thin-air values for the sum of cache weights
+    /// Use only for the statistics purpose
+    size_t getWeight() const final;
+
+    /// Get a number of useful items in the cache
+    /// Note: can return out-of-thin-air values for the sum of cache weights
+    /// Use only for the statistics purpose
+    size_t getCount() const final;
+
+    void purge() final;
+
+    void reset() final;
+
+private:
+    std::vector<std::string> block_cache_names;
+    BlockCacheStatsMapping block_cache_stats;
+    BuddyArena memory_arena;
+    Settings settings;
+
+    std::mutex stealing_mutex;
+
+    void shrinkBlockCaches(bool use_limit);
+
+    size_t roundUpToPowerOf2(size_t x, size_t min_result)
+    {
+        size_t power = min_result;
+        while (power < x)
+            power *= 2;
+        return power;
+    }
 };
 
 
@@ -465,7 +759,7 @@ public:
     void initialize(
         const std::vector<std::string> & block_cache_names,
         std::string_view rebalance_strategy_name = "",
-        const BlockCacheSettingsMapping & cache_settings = {});
+        const RebalanceStrategySettings & rebalance_strategy_settings = {});
 
     /// block_caches hashmap doesn't change since initialize function so we can access it wihtout locking
     BlockCache<Key> & getBlockCacheInstance(const std::string & name);
@@ -480,6 +774,7 @@ public:
 
 private:
     BlockCacheMapping block_caches;
+    /// TODO: Change shared_ptr to unique_ptr
     std::shared_ptr<RebalanceStrategy> rebalance_strategy;
 
     static constexpr std::string_view default_rebalance_strategy = "dummy";
