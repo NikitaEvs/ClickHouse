@@ -1417,8 +1417,8 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     /// Buddy dynamic strategy
     auto memory_arena_capacity = 4_GiB;
-    auto memory_arena_initial_size = 128_MiB;
-    size_t allocated_memory_multiplier = 2;
+    UInt64 memory_arena_initial_size = 0;
+    size_t allocated_memory_multiplier = 1;
     auto max_size_to_evict_on_purging = 300_MiB;
     std::string rebalance_strategy_name = "buddy_dynamic";
     RebalanceStrategySettings rebalance_strategy_settings;

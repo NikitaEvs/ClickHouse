@@ -7,6 +7,7 @@
 #include <Interpreters/Context.h>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <boost/intrusive/list.hpp>
@@ -355,7 +356,10 @@ private:
     /// Evicting regions from cache until requested_size is evicted or cache is empty
     RegionMetadata * evict(size_t requested_size, std::lock_guard<std::mutex> & cache_lock) noexcept;
 
+    struct HolderCreater;
+
 public:
+
     struct Holder : private boost::noncopyable
     {
         Holder(BlockCache & cache_, RegionMetadata & region_, std::lock_guard<std::mutex>&);
@@ -375,12 +379,95 @@ public:
         Key key() const { return region.key; }
 
     private:
+        friend struct HolderCreater;
+
         BlockCache & cache;
         RegionMetadata & region;
         void * region_ptr;
     };
 
     using HolderPtr = Holder *;
+
+private:
+    struct HolderCreater : private boost::noncopyable
+    {
+        HolderCreater(BlockCache & cache_, RegionMetadata & region_, std::lock_guard<std::mutex> & cache_lock);
+        ~HolderCreater() = default;
+
+        HolderPtr acquireHolder(std::lock_guard<std::mutex> & cache_lock);
+
+    private:
+        Holder initial_holder;
+    };
+
+    using HolderCreaterPtr = HolderCreater *;
+
+    /// Represents pending insertion attempt.
+    struct InsertToken
+    {
+        explicit InsertToken(BlockCache<Key> & cache_) : cache(cache_) {}
+        ~InsertToken() { delete value; }
+
+        std::mutex mutex;
+        bool cleaned_up = false; /// Protected by the token mutex
+        HolderCreaterPtr value = nullptr; /// Protected by the token mutex
+
+        BlockCache<Key> & cache;
+        size_t refcount = 0; /// Protected by the cache mutex
+    };
+
+    using InsertTokens = std::unordered_map<Key, std::shared_ptr<InsertToken>>;
+    InsertTokens insert_tokens;
+
+    /// This class is responsible for removing used insert tokens from the insert_tokens map.
+    /// Among several concurrent threads the first successful one is responsible for removal. But if they all
+    /// fail, then the last one is responsible.
+    struct InsertTokenHolder
+    {
+        const Key * key = nullptr;
+        std::shared_ptr<InsertToken> token;
+        bool cleaned_up = false;
+
+        InsertTokenHolder() = default;
+
+        void acquire(const Key * key_, const std::shared_ptr<InsertToken> & token_, [[maybe_unused]] std::lock_guard<std::mutex> & cache_lock)
+        {
+            key = key_;
+            token = token_;
+            ++token->refcount;
+        }
+
+        void cleanup([[maybe_unused]] std::lock_guard<std::mutex> & token_lock, [[maybe_unused]] std::lock_guard<std::mutex> & cache_lock)
+        {
+            token->cache.insert_tokens.erase(*key);
+            token->cleaned_up = true;
+            cleaned_up = true;
+        }
+
+        ~InsertTokenHolder()
+        {
+            if (!token)
+                return;
+
+            if (cleaned_up)
+                return;
+
+            std::lock_guard token_lock(token->mutex);
+
+            if (token->cleaned_up)
+                return;
+
+            std::lock_guard cache_lock(token->cache.mutex);
+
+            --token->refcount;
+            if (token->refcount == 0)
+                cleanup(token_lock, cache_lock);
+        }
+    };
+
+    friend struct InsertTokenHolder;
+
+public:
 
     BlockCache(const std::string & name_, std::shared_ptr<RebalanceStrategy> rebalance_strategy_);
 
@@ -395,7 +482,9 @@ public:
                        bool * was_calculated)
     {
         /// TODO: Remove temp hack, add single-flight system
-        std::lock_guard get_or_set_lock(get_or_set_mutex);
+        InsertTokenHolder token_holder;
+
+        // std::lock_guard get_or_set_lock(get_or_set_mutex);
 
         {
             std::lock_guard cache_lock(mutex);
@@ -407,13 +496,32 @@ public:
                     *was_calculated = false;
                 return new Holder(*this, *it, cache_lock);
             }
+
+            auto & token = insert_tokens[key];
+            if (!token)
+                token = std::make_shared<InsertToken>(*this);
+
+            token_holder.acquire(&key, token, cache_lock);
+        }
+
+        InsertToken * token = token_holder.token.get();
+
+        std::lock_guard token_lock(token->mutex);
+        token_holder.cleaned_up = token->cleaned_up;
+        if (token->value)
+        {
+            if (was_calculated)
+                *was_calculated = false;
+
+            std::lock_guard cache_lock(mutex);
+            return token->value->acquireHolder(cache_lock);
         }
 
         RegionMetadata * region;
         size_t size = get_size();
         region = allocate(size);
 
-        if (!region)
+        if (!region) 
             return {};
 
         region->key = key;
@@ -430,7 +538,20 @@ public:
         }
 
         std::lock_guard cache_lock(mutex);
-        key_map.insert(*region);
+        // key_map.insert(*region);
+        token->value = new HolderCreater(*this, *region, cache_lock);
+        auto * holder = token->value->acquireHolder(cache_lock);
+
+        /// Insert the new value only if the token is still in present in insert_tokens.
+        /// (The token may be absent because of a concurrent reset() call).
+        auto token_it = insert_tokens.find(key);
+        if (token_it != insert_tokens.end() && token_it->second.get() == token)
+        {
+            key_map.insert(*region);
+        }
+        if (!token->cleaned_up)
+            token_holder.cleanup(token_lock, cache_lock);
+
         if (was_calculated)
             *was_calculated = true;
 
@@ -440,7 +561,8 @@ public:
             total_useful_cache_count.fetch_add(1, std::memory_order_relaxed);
         }
 
-        return new Holder(*this, *region, cache_lock);
+        // return new Holder(*this, *region, cache_lock);
+        return holder;
     }
 
     HolderPtr get(const Key & key);
@@ -507,6 +629,14 @@ public:
     virtual void purge() = 0;
     virtual void reset() = 0;
 
+    struct StatRequest {
+        std::string block_cache_name;
+        std::string stat_name;
+    };
+    using StatRequests = std::vector<StatRequest>;
+    using StatResponses = std::vector<Field>;
+    virtual StatResponses getStats(const StatRequests & requests) = 0; 
+
 protected:
     BlockCacheMapping & caches;
 };
@@ -516,8 +646,10 @@ template <typename Key>
 class DummyRebalanceStrategy : public IRebalanceStrategy<Key>
 {
     using Base = IRebalanceStrategy<Key>;
-    using BlockCacheMapping = typename IRebalanceStrategy<Key>::BlockCacheMapping;
+    using BlockCacheMapping = typename Base::BlockCacheMapping;
     using BlockCache = BlockCache<Key>;
+    using StatRequests = typename Base::StatRequests;
+    using StatResponses = typename Base::StatResponses;
 
 public:
     struct BlockCacheStats 
@@ -573,6 +705,8 @@ public:
 
     void reset() final;
 
+    StatResponses getStats(const StatRequests & requests) final; 
+
 private:
     std::vector<std::string> block_cache_names;
     BlockCacheStatsMapping block_cache_stats;
@@ -591,8 +725,10 @@ template <typename Key>
 class BuddyStaticRebalanceStrategy : public IRebalanceStrategy<Key>
 {
     using Base = IRebalanceStrategy<Key>;
-    using BlockCacheMapping = typename IRebalanceStrategy<Key>::BlockCacheMapping;
+    using BlockCacheMapping = typename Base::BlockCacheMapping;
     using BlockCache = BlockCache<Key>;
+    using StatRequests = typename Base::StatRequests;
+    using StatResponses = typename Base::StatResponses;
 
 public:
     struct BlockCacheStats 
@@ -645,6 +781,8 @@ public:
 
     void reset() final;
 
+    StatResponses getStats(const StatRequests & requests) final; 
+
 private:
     std::vector<std::string> block_cache_names;
     BlockCacheStatsMapping block_cache_stats;
@@ -667,13 +805,20 @@ template <typename Key>
 class BuddyDynamicRebalanceStrategy : public IRebalanceStrategy<Key>
 {
     using Base = IRebalanceStrategy<Key>;
-    using BlockCacheMapping = typename IRebalanceStrategy<Key>::BlockCacheMapping;
+    using BlockCacheMapping = typename Base::BlockCacheMapping;
     using BlockCache = BlockCache<Key>;
+    using StatRequests = typename Base::StatRequests;
+    using StatResponses = typename Base::StatResponses;
 
 public:
     struct BlockCacheStats 
     {
         std::atomic<size_t> total_memory_blocks_size = 0;
+
+        /// Scores that equals to shouldRebalance calls minus attempts to steal from this pool
+        std::atomic<int64_t> should_rebalance_to_stealing_attempts_diff = 0;
+
+        std::atomic<size_t> memory_allocation_failures = 0;
 
         BlockCacheStats() = default;
     };
@@ -696,7 +841,7 @@ public:
         size_t memory_arena_initial_size = 0;
         size_t allocated_memory_multiplier = 1;
 
-        static constexpr size_t minimal_allocation_size = 4096;
+        static constexpr size_t minimal_allocation_size = 64 * 1024 * 1024;
     };
 
     BuddyDynamicRebalanceStrategy(BlockCacheMapping & caches_, const std::vector<std::string> & block_cache_names_);
@@ -723,6 +868,8 @@ public:
 
     void reset() final;
 
+    StatResponses getStats(const StatRequests & requests) final; 
+
 private:
     std::vector<std::string> block_cache_names;
     BlockCacheStatsMapping block_cache_stats;
@@ -748,6 +895,8 @@ class BlockCachesManager
 {
     using RebalanceStrategy = IRebalanceStrategy<Key>;
     using BlockCacheMapping = typename RebalanceStrategy::BlockCacheMapping;
+    using StatRequests = typename RebalanceStrategy::StatRequests;
+    using StatResponses = typename RebalanceStrategy::StatResponses;
 
 public:
     static BlockCachesManager<Key> & instance()
@@ -771,6 +920,8 @@ public:
     void purge();
 
     void reset();
+
+    StatResponses getStats(const StatRequests & requests); 
 
 private:
     BlockCacheMapping block_caches;

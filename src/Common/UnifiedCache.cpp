@@ -591,6 +591,20 @@ BlockCache<Key>::Holder::~Holder()
         cache.lru_list.push_back(region);
 }
 
+
+template <typename Key>
+BlockCache<Key>::HolderCreater::HolderCreater(BlockCache<Key> & cache_, BlockCache<Key>::RegionMetadata & region_, std::lock_guard<std::mutex> & cache_lock)
+    : initial_holder(cache_, region_, cache_lock)
+{}
+
+template <typename Key>
+typename BlockCache<Key>::Holder* BlockCache<Key>::HolderCreater::acquireHolder(std::lock_guard<std::mutex> & cache_lock) 
+{
+    auto * holder = new Holder(initial_holder.cache, initial_holder.region, cache_lock);
+    return holder;
+}
+
+
 template <typename Key>
 typename BlockCache<Key>::RegionMetadata * BlockCache<Key>::addNewRegion(
     MemoryBlock & memory_block, 
@@ -1055,6 +1069,22 @@ void DummyRebalanceStrategy<Key>::reset()
 }
 
 template <typename Key>
+typename DummyRebalanceStrategy<Key>::StatResponses DummyRebalanceStrategy<Key>::getStats(const StatRequests & requests)
+{
+    StatResponses responses;
+    for (const auto & request : requests)
+    {
+        auto & stats_entry = block_cache_stats[request.block_cache_name];
+        const auto & stat_name = request.stat_name;
+        if (stat_name == "total_memory_blocks_size")
+            responses.push_back(Field(stats_entry.total_memory_blocks_size.load(std::memory_order_relaxed)));
+        else
+            throw Exception("Invalid stat name in getStats method", ErrorCodes::BAD_ARGUMENTS);
+    }
+    return responses;
+}
+
+template <typename Key>
 void DummyRebalanceStrategy<Key>::shrinkBlockCaches(bool use_limit)
 {
     for (auto & item : block_cache_stats) 
@@ -1104,10 +1134,7 @@ void BuddyStaticRebalanceStrategy<Key>::shouldRebalance(const std::string & call
 
     auto * block_ptr = memory_arena.malloc(required_block_size);
     if (block_ptr == nullptr)
-    {
-        std::cerr << "Cannot allocate a block with size " << required_block_size << std::endl;
         return;
-    }
 
     auto * block = MemoryBlock::create(block_ptr, required_block_size);
 
@@ -1189,6 +1216,22 @@ void BuddyStaticRebalanceStrategy<Key>::reset()
 }
 
 template <typename Key>
+typename BuddyStaticRebalanceStrategy<Key>::StatResponses BuddyStaticRebalanceStrategy<Key>::getStats(const StatRequests & requests)
+{
+    StatResponses responses;
+    for (const auto & request : requests)
+    {
+        auto & stats_entry = block_cache_stats[request.block_cache_name];
+        const auto & stat_name = request.stat_name;
+        if (stat_name == "total_memory_blocks_size")
+            responses.push_back(Field(stats_entry.total_memory_blocks_size.load(std::memory_order_relaxed)));
+        else
+            throw Exception("Invalid stat name in getStats method", ErrorCodes::BAD_ARGUMENTS);
+    }
+    return responses;
+}
+
+template <typename Key>
 void BuddyStaticRebalanceStrategy<Key>::shrinkBlockCaches(bool use_limit)
 {
     for (auto & item : block_cache_stats) 
@@ -1232,6 +1275,10 @@ MemoryBlockList BuddyDynamicRebalanceStrategy<Key>::initialize(const std::string
 template <typename Key>
 void BuddyDynamicRebalanceStrategy<Key>::shouldRebalance(const std::string & caller_name, size_t new_item_size)
 {
+    auto & caller_stats_entry = block_cache_stats[caller_name];
+
+    caller_stats_entry.should_rebalance_to_stealing_attempts_diff.fetch_add(1, std::memory_order_relaxed);
+
     assert(block_cache_stats.count(caller_name) != 0);
     size_t required_block_size = roundUpToPowerOf2(new_item_size, Settings::minimal_allocation_size);
 
@@ -1242,9 +1289,15 @@ void BuddyDynamicRebalanceStrategy<Key>::shouldRebalance(const std::string & cal
         for (auto & item : Base::caches) 
         {
             const auto & name = item.first;
+            /// Do not steal from themselves
             if (name == caller_name) 
                 continue;
             auto & block_cache = item.second;
+            auto & current_stats_entry = block_cache_stats[name];
+
+            /// Do not steal from the cache pool with a positive difference between shouldRebalance calls and attempts to steal from it
+            if (current_stats_entry.should_rebalance_to_stealing_attempts_diff.fetch_sub(1, std::memory_order_relaxed) >= 0)
+                continue;
 
             size_t initial_size = block_cache.getCacheWeight();
             auto blocks = block_cache.takeMemoryBlocks(0);
@@ -1252,8 +1305,7 @@ void BuddyDynamicRebalanceStrategy<Key>::shouldRebalance(const std::string & cal
             size_t after_steal_size = block_cache.getCacheWeight();
             assert(initial_size >= after_steal_size);
 
-            auto & stats_entry = block_cache_stats[name];
-            stats_entry.total_memory_blocks_size.fetch_sub(initial_size - after_steal_size, std::memory_order_relaxed);
+            current_stats_entry.total_memory_blocks_size.fetch_sub(initial_size - after_steal_size, std::memory_order_relaxed);
         }
     }
 
@@ -1267,7 +1319,10 @@ void BuddyDynamicRebalanceStrategy<Key>::shouldRebalance(const std::string & cal
     /// Take memory from the BuddyArena
     auto * block_ptr = memory_arena.malloc(settings.allocated_memory_multiplier * required_block_size);
     if (block_ptr == nullptr)
+    {
+        caller_stats_entry.memory_allocation_failures.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
 
     auto * block = MemoryBlock::create(block_ptr, required_block_size);
 
@@ -1276,8 +1331,7 @@ void BuddyDynamicRebalanceStrategy<Key>::shouldRebalance(const std::string & cal
     memory_blocks.push_back(*block);
     Base::caches.at(caller_name).addNewMemoryBlocks(memory_blocks);
 
-    auto & stats_entry = block_cache_stats[caller_name];
-    stats_entry.total_memory_blocks_size.fetch_add(required_block_size, std::memory_order_relaxed);
+    caller_stats_entry.total_memory_blocks_size.fetch_add(required_block_size, std::memory_order_relaxed);
 }
 
 template <typename Key>
@@ -1357,6 +1411,26 @@ void BuddyDynamicRebalanceStrategy<Key>::reset()
 }
 
 template <typename Key>
+typename BuddyDynamicRebalanceStrategy<Key>::StatResponses BuddyDynamicRebalanceStrategy<Key>::getStats(const StatRequests & requests)
+{
+    StatResponses responses;
+    for (const auto & request : requests)
+    {
+        auto & stats_entry = block_cache_stats[request.block_cache_name];
+        const auto & stat_name = request.stat_name;
+        if (stat_name == "total_memory_blocks_size")
+            responses.push_back(Field(stats_entry.total_memory_blocks_size.load(std::memory_order_relaxed)));
+        else if (stat_name == "should_rebalance_to_stealing_attempts_diff")
+            responses.push_back(Field(stats_entry.should_rebalance_to_stealing_attempts_diff.load(std::memory_order_relaxed)));
+        else if (stat_name == "memory_allocation_failures")
+            responses.push_back(Field(stats_entry.memory_allocation_failures.load(std::memory_order_relaxed)));
+        else
+            throw Exception("Invalid stat name in getStats method", ErrorCodes::BAD_ARGUMENTS);
+    }
+    return responses;
+}
+
+template <typename Key>
 void BuddyDynamicRebalanceStrategy<Key>::shrinkBlockCaches(bool use_limit)
 {
     for (auto & item : block_cache_stats) 
@@ -1385,7 +1459,6 @@ void BlockCachesManager<Key>::initialize(
     std::string_view rebalance_strategy_name,
     const RebalanceStrategySettings & rebalance_strategy_settings)
 {
-    std::cerr << "Rebalance strategy name: " << rebalance_strategy_name << std::endl;
     if (rebalance_strategy_name.empty()) 
         rebalance_strategy_name = default_rebalance_strategy;
 
@@ -1437,6 +1510,11 @@ void BlockCachesManager<Key>::reset()
     rebalance_strategy->reset();
 }
 
+template <typename Key>
+typename BlockCachesManager<Key>::StatResponses BlockCachesManager<Key>::getStats(const StatRequests & requests)
+{
+    return rebalance_strategy->getStats(requests);
+}
 
 template class BlockCache<UInt128>;
 template class DummyRebalanceStrategy<UInt128>;
