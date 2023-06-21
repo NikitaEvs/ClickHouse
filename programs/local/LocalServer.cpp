@@ -23,6 +23,7 @@
 #include <Common/TLDListsHolder.h>
 #include <Common/quoteString.h>
 #include <Common/randomSeed.h>
+#include <Common/UnifiedCache.h>
 #include <Loggers/Loggers.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromString.h>
@@ -559,27 +560,69 @@ void LocalServer::processConfig()
     /// There is no need for concurrent queries, override max_concurrent_queries.
     global_context->getProcessList().setMaxSize(0);
 
+    /// Set up caches.
+
+    /// Dummy strategy
+    // auto block_cache_size = 1000_MiB;
+    // auto max_size_to_evict_on_purging = 300_MiB;
+    // std::string rebalance_strategy_name = "dummy";
+    // RebalanceStrategySettings rebalance_strategy_settings;
+    // rebalance_strategy_settings.setBlockCacheSetting("max_total_size", "marks", Field(block_cache_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_total_size", "uncompressed", Field(block_cache_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    /// Buddy static strategy
+    // auto memory_arena_size = 4_GiB;
+    // auto max_size_to_evict_on_purging = 300_MiB;
+    // std::string rebalance_strategy_name = "buddy_static";
+    // RebalanceStrategySettings rebalance_strategy_settings;
+    // rebalance_strategy_settings.set("memory_arena_size", Field(memory_arena_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    /// Buddy dynamic strategy
+    auto memory_arena_capacity = 4_GiB;
+    auto memory_arena_initial_size = 128_MiB;
+    size_t allocated_memory_multiplier = 2;
+    auto max_size_to_evict_on_purging = 300_MiB;
+    std::string rebalance_strategy_name = "buddy_dynamic";
+    RebalanceStrategySettings rebalance_strategy_settings;
+    rebalance_strategy_settings.set("memory_arena_capacity", Field(memory_arena_capacity));
+    rebalance_strategy_settings.set("memory_arena_initial_size", Field(memory_arena_initial_size));
+    rebalance_strategy_settings.set("allocated_memory_multiplier", Field(allocated_memory_multiplier));
+    rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    auto & block_cache_manager = DB::BlockCachesManager<UInt128>::instance();
+    std::vector<std::string> block_cache_names = {"marks", "uncompressed"};
+    block_cache_manager.initialize(block_cache_names, rebalance_strategy_name, rebalance_strategy_settings);
+
     /// Size of cache for uncompressed blocks. Zero means disabled.
     String uncompressed_cache_policy = config().getString("uncompressed_cache_policy", "");
     size_t uncompressed_cache_size = config().getUInt64("uncompressed_cache_size", 0);
     if (uncompressed_cache_size)
-        global_context->setUncompressedCache(uncompressed_cache_size, uncompressed_cache_policy);
+        global_context->setUncompressedCache("global");
+        // global_context->setUncompressedCache(uncompressed_cache_size, uncompressed_cache_policy);
 
     /// Size of cache for marks (index of MergeTree family of tables).
     String mark_cache_policy = config().getString("mark_cache_policy", "");
     size_t mark_cache_size = config().getUInt64("mark_cache_size", 5368709120);
     if (mark_cache_size)
-        global_context->setMarkCache(mark_cache_size, mark_cache_policy);
+        global_context->setMarkCache("global");
+        // global_context->setMarkCache(mark_cache_size, mark_cache_policy);
 
     /// Size of cache for uncompressed blocks of MergeTree indices. Zero means disabled.
     size_t index_uncompressed_cache_size = config().getUInt64("index_uncompressed_cache_size", 0);
     if (index_uncompressed_cache_size)
-        global_context->setIndexUncompressedCache(index_uncompressed_cache_size);
+        global_context->setIndexUncompressedCache("global");
+        // global_context->setIndexUncompressedCache(index_uncompressed_cache_size);
 
     /// Size of cache for index marks (index of MergeTree skip indices).
     size_t index_mark_cache_size = config().getUInt64("index_mark_cache_size", 0);
     if (index_mark_cache_size)
-        global_context->setIndexMarkCache(index_mark_cache_size);
+        global_context->setIndexMarkCache("global");
+        // global_context->setIndexMarkCache(index_mark_cache_size);
 
     /// A cache for mmapped files.
     size_t mmap_cache_size = config().getUInt64("mmap_cache_size", 1000);   /// The choice of default is arbitrary.

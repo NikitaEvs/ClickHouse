@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include <Common/UnifiedCache.h>
 #include <Common/CacheBase.h>
 #include <Common/ProfileEvents.h>
 #include <Common/SipHash.h>
@@ -18,30 +19,15 @@ namespace ProfileEvents
 namespace DB
 {
 
-/// Estimate of number of bytes in cache for marks.
-struct MarksWeightFunction
-{
-    /// We spent additional bytes on key in hashmap, linked lists, shared pointers, etc ...
-    static constexpr size_t MARK_CACHE_OVERHEAD = 128;
-
-    size_t operator()(const MarksInCompressedFile & marks) const
-    {
-        return marks.size() * sizeof(MarkInCompressedFile) + MARK_CACHE_OVERHEAD;
-    }
-};
-
-
-/** Cache of 'marks' for StorageMergeTree.
-  * Marks is an index structure that addresses ranges in column file, corresponding to ranges of primary key.
-  */
-class MarkCache : public CacheBase<UInt128, MarksInCompressedFile, UInt128TrivialHash, MarksWeightFunction>
+class MarkCache : public UnifiedCacheAdapter<UInt128, MarksInCompressedFile> 
 {
 private:
-    using Base = CacheBase<UInt128, MarksInCompressedFile, UInt128TrivialHash, MarksWeightFunction>;
+    using Base = UnifiedCacheAdapter<UInt128, MarksInCompressedFile>;
+    using HolderPtr = Base::CachePayloadHolderPtr;
 
 public:
-    explicit MarkCache(size_t max_size_in_bytes, const String & mark_cache_policy = "")
-        : Base(max_size_in_bytes, 0, mark_cache_policy) {}
+    explicit MarkCache(const String & block_cache_name) : Base(block_cache_name) 
+    {}
 
     /// Calculate key from path to file and offset.
     static UInt128 hash(const String & path_to_file)
@@ -55,16 +41,17 @@ public:
         return key;
     }
 
-    template <typename LoadFunc>
-    MappedPtr getOrSet(const Key & key, LoadFunc && load)
+    template <typename GetSizeFunc, typename InitializeFunc>
+    HolderPtr getOrSet(const Key & key, GetSizeFunc && get_size, InitializeFunc && initialize)
     {
-        auto result = Base::getOrSet(key, load);
-        if (result.second)
+        bool was_calculated = false;
+        auto result = Base::getOrSet(key, std::forward<GetSizeFunc>(get_size), std::forward<InitializeFunc>(initialize), &was_calculated);
+        if (was_calculated)
             ProfileEvents::increment(ProfileEvents::MarkCacheMisses);
         else
             ProfileEvents::increment(ProfileEvents::MarkCacheHits);
 
-        return result.first;
+        return result;
     }
 };
 

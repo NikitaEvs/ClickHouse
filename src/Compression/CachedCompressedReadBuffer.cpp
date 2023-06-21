@@ -2,6 +2,7 @@
 
 #include <IO/WriteHelpers.h>
 #include <Compression/LZ4_decompress_faster.h>
+#include "IO/UncompressedCache.h"
 
 #include <utility>
 
@@ -40,31 +41,48 @@ bool CachedCompressedReadBuffer::nextImpl()
     /// Let's check for the presence of a decompressed block in the cache, grab the ownership of this block, if it exists.
     UInt128 key = cache->hash(path, file_pos);
 
-    owned_cell = cache->getOrSet(key, [&]()
+    size_t size_compressed = 0;
+    size_t size_decompressed = 0;
+    size_t size_compressed_without_checksum = 0;
+    size_t additional_bytes = 0;
+
+    auto get_size = [&]() -> size_t
     {
         initInput();
         file_in->seek(file_pos, SEEK_SET);
 
-        auto cell = std::make_shared<UncompressedCacheCell>();
-
-        size_t size_decompressed;
-        size_t size_compressed_without_checksum;
-        cell->compressed_size = readCompressedData(size_decompressed, size_compressed_without_checksum, false);
-
-        if (cell->compressed_size)
+        size_compressed = readCompressedData(size_decompressed, size_compressed_without_checksum, false);   
+        if (size_compressed > 0) 
         {
-            cell->additional_bytes = codec->getAdditionalSizeAtTheEndOfBuffer();
-            cell->data.resize(size_decompressed + cell->additional_bytes);
-            decompressTo(cell->data.data(), size_decompressed, size_compressed_without_checksum);
+            additional_bytes = codec->getAdditionalSizeAtTheEndOfBuffer();
+            return size_decompressed + additional_bytes;
         }
+        else 
+        {
+            return 0;
+        }
+    };
 
-        return cell;
-    });
+    auto initialize = [&](void * ptr)
+    {
+        auto * data_ptr = reinterpret_cast<char *>(ptr) + sizeof(UncompressedCacheCell);
+        auto * uncompressed_payload = new (ptr) UncompressedCacheCell();
+        uncompressed_payload->data = data_ptr;
+        uncompressed_payload->data_size = size_decompressed + additional_bytes;
+        uncompressed_payload->compressed_size = size_compressed;
+        uncompressed_payload->additional_bytes = additional_bytes;
 
-    if (owned_cell->data.size() == 0)
+        decompressTo(data_ptr, size_decompressed, size_compressed_without_checksum);
+    };
+
+    owned_region = cache->getOrSet(key, get_size, initialize);
+
+    auto & owned_cell = owned_region->payload();
+
+    if (owned_cell.data_size == 0)
         return false;
 
-    working_buffer = Buffer(owned_cell->data.data(), owned_cell->data.data() + owned_cell->data.size() - owned_cell->additional_bytes);
+    working_buffer = Buffer(owned_cell.data, owned_cell.data + owned_cell.data_size - owned_cell.additional_bytes);
 
     /// nextimpl_working_buffer_offset is set in the seek function (lazy seek). So we have to
     /// check that we are not seeking beyond working buffer.
@@ -73,7 +91,7 @@ bool CachedCompressedReadBuffer::nextImpl()
         " (pos: " + toString(nextimpl_working_buffer_offset) + ", block size: " + toString(working_buffer.size()) + ")",
         ErrorCodes::SEEK_POSITION_OUT_OF_BOUND);
 
-    file_pos += owned_cell->compressed_size;
+    file_pos += owned_cell.compressed_size;
 
     return true;
 }
@@ -88,13 +106,13 @@ CachedCompressedReadBuffer::CachedCompressedReadBuffer(
 void CachedCompressedReadBuffer::seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block)
 {
     /// Nothing to do if we already at required position
-    if (!owned_cell && file_pos == offset_in_compressed_file
+    if (!owned_region && file_pos == offset_in_compressed_file
         && ((!buffer().empty() && offset() == offset_in_decompressed_block) ||
             nextimpl_working_buffer_offset == offset_in_decompressed_block))
         return;
 
-    if (owned_cell &&
-        offset_in_compressed_file == file_pos - owned_cell->compressed_size &&
+    if (owned_region &&
+        offset_in_compressed_file == file_pos - owned_region->payload().compressed_size &&
         offset_in_decompressed_block <= working_buffer.size())
     {
         pos = working_buffer.begin() + offset_in_decompressed_block;
@@ -107,7 +125,7 @@ void CachedCompressedReadBuffer::seek(size_t offset_in_compressed_file, size_t o
         bytes += offset();
         /// No data, everything discarded
         resetWorkingBuffer();
-        owned_cell.reset();
+        owned_region.reset();
 
         /// Remember required offset in decompressed block which will be set in
         /// the next ReadBuffer::next() call

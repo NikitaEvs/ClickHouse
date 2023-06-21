@@ -11,6 +11,7 @@
 #include <Poco/Net/NetException.h>
 #include <Poco/Util/HelpFormatter.h>
 #include <Poco/Environment.h>
+#include <Common/UnifiedCache.h>
 #include <Common/scope_guard_safe.h>
 #include <Common/logger_useful.h>
 #include <base/phdr_cache.h>
@@ -1145,6 +1146,8 @@ int Server::main(const std::vector<std::string> & /*args*/)
             }
 
             total_memory_tracker.setHardLimit(max_server_memory_usage);
+            /// TODO: Add setting
+            // total_memory_tracker.setLimitToPurgeCache(1500_MiB);
             total_memory_tracker.setDescription("(total)");
             total_memory_tracker.setMetric(CurrentMetrics::MemoryTracking);
 
@@ -1393,6 +1396,42 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     /// Set up caches.
 
+    /// Dummy strategy
+    // auto block_cache_size = 1000_MiB;
+    // auto max_size_to_evict_on_purging = 300_MiB;
+    // std::string rebalance_strategy_name = "dummy";
+    // RebalanceStrategySettings rebalance_strategy_settings;
+    // rebalance_strategy_settings.setBlockCacheSetting("max_total_size", "marks", Field(block_cache_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_total_size", "uncompressed", Field(block_cache_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    /// Buddy static strategy
+    // auto memory_arena_size = 4_GiB;
+    // auto max_size_to_evict_on_purging = 300_MiB;
+    // std::string rebalance_strategy_name = "buddy_static";
+    // RebalanceStrategySettings rebalance_strategy_settings;
+    // rebalance_strategy_settings.set("memory_arena_size", Field(memory_arena_size));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    // rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    /// Buddy dynamic strategy
+    auto memory_arena_capacity = 4_GiB;
+    UInt64 memory_arena_initial_size = 0;
+    size_t allocated_memory_multiplier = 1;
+    auto max_size_to_evict_on_purging = 300_MiB;
+    std::string rebalance_strategy_name = "buddy_dynamic";
+    RebalanceStrategySettings rebalance_strategy_settings;
+    rebalance_strategy_settings.set("memory_arena_capacity", Field(memory_arena_capacity));
+    rebalance_strategy_settings.set("memory_arena_initial_size", Field(memory_arena_initial_size));
+    rebalance_strategy_settings.set("allocated_memory_multiplier", Field(allocated_memory_multiplier));
+    rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "marks", Field(max_size_to_evict_on_purging));
+    rebalance_strategy_settings.setBlockCacheSetting("max_size_to_evict_on_purging", "uncompressed", Field(max_size_to_evict_on_purging));
+
+    auto & block_cache_manager = DB::BlockCachesManager<UInt128>::instance();
+    std::vector<std::string> block_cache_names = {"marks", "uncompressed"};
+    block_cache_manager.initialize(block_cache_names, rebalance_strategy_name, rebalance_strategy_settings);
+
     /// Lower cache size on low-memory systems.
     double cache_size_to_ram_max_ratio = config().getDouble("cache_size_to_ram_max_ratio", 0.5);
     size_t max_cache_size = static_cast<size_t>(memory_amount * cache_size_to_ram_max_ratio);
@@ -1407,7 +1446,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
         LOG_INFO(log, "Uncompressed cache size was lowered to {} because the system has low amount of memory",
             formatReadableSizeWithBinarySuffix(uncompressed_cache_size));
     }
-    global_context->setUncompressedCache(uncompressed_cache_size, uncompressed_cache_policy);
+    global_context->setUncompressedCache("uncompressed");
 
     /// Load global settings from default_profile and system_profile.
     global_context->setDefaultProfiles(config());
@@ -1434,17 +1473,17 @@ int Server::main(const std::vector<std::string> & /*args*/)
         LOG_INFO(log, "Mark cache size was lowered to {} because the system has low amount of memory",
             formatReadableSizeWithBinarySuffix(mark_cache_size));
     }
-    global_context->setMarkCache(mark_cache_size, mark_cache_policy);
+    global_context->setMarkCache("marks");
 
     /// Size of cache for uncompressed blocks of MergeTree indices. Zero means disabled.
     size_t index_uncompressed_cache_size = config().getUInt64("index_uncompressed_cache_size", 0);
     if (index_uncompressed_cache_size)
-        global_context->setIndexUncompressedCache(index_uncompressed_cache_size);
+        global_context->setIndexUncompressedCache("uncompressed");
 
     /// Size of cache for index marks (index of MergeTree skip indices).
     size_t index_mark_cache_size = config().getUInt64("index_mark_cache_size", 0);
     if (index_mark_cache_size)
-        global_context->setIndexMarkCache(index_mark_cache_size);
+        global_context->setIndexMarkCache("marks");
 
     /// A cache for mmapped files.
     size_t mmap_cache_size = config().getUInt64("mmap_cache_size", 1000);   /// The choice of default is arbitrary.

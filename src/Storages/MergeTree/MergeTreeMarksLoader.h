@@ -3,7 +3,9 @@
 #include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MarkCache.h>
 #include <IO/ReadSettings.h>
+#include <Common/UnifiedCache.h>
 #include <Common/ThreadPool.h>
+#include <Formats/MarkInCompressedFile.h>
 
 
 namespace DB
@@ -15,7 +17,9 @@ class Threadpool;
 class MergeTreeMarksLoader
 {
 public:
-    using MarksPtr = MarkCache::MappedPtr;
+    using SharedMarksHolder = SharedPayloadHolder<MarksInCompressedFile>;
+    using MarksHolder = PayloadHolder<MarksInCompressedFile>;
+    using MarksHolderPtr = std::shared_ptr<MarksHolder>;
 
     MergeTreeMarksLoader(
         DataPartStoragePtr data_part_storage_,
@@ -40,14 +44,15 @@ private:
     const MergeTreeIndexGranularityInfo & index_granularity_info;
     bool save_marks_in_cache = false;
     size_t columns_in_mark;
-    MarkCache::MappedPtr marks;
+    MarksHolderPtr marks;  
     ReadSettings read_settings;
 
-    MarkCache::MappedPtr loadMarks();
-    std::future<MarkCache::MappedPtr> loadMarksAsync();
-    MarkCache::MappedPtr loadMarksImpl();
+    void readIntoMarks(MarksInCompressedFile & marks_to_load);
+    MarksHolderPtr loadMarksImpl();
+    MarksHolderPtr loadMarks();
+    std::future<MarksHolderPtr> loadMarksAsync();
 
-    std::future<MarkCache::MappedPtr> future;
+    std::future<MarksHolderPtr> future;
     ThreadPool * load_marks_threadpool;
 };
 

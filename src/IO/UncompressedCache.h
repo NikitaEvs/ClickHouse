@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Common/UnifiedCache.h>
 #include <Common/SipHash.h>
 #include <Common/ProfileEvents.h>
 #include <Common/HashTable/Hash.h>
@@ -20,30 +21,22 @@ namespace DB
 
 struct UncompressedCacheCell
 {
-    Memory<> data;
+    char * data;
+    size_t data_size;
     size_t compressed_size;
     UInt32 additional_bytes;
 };
 
-struct UncompressedSizeWeightFunction
-{
-    size_t operator()(const UncompressedCacheCell & x) const
-    {
-        return x.data.size();
-    }
-};
 
-
-/** Cache of decompressed blocks for implementation of CachedCompressedReadBuffer. thread-safe.
-  */
-class UncompressedCache : public CacheBase<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>
+class UncompressedCache : public UnifiedCacheAdapter<UInt128, UncompressedCacheCell> 
 {
 private:
-    using Base = CacheBase<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>;
+    using Base = UnifiedCacheAdapter<UInt128, UncompressedCacheCell>;
+    using HolderPtr = Base::CachePayloadHolderPtr;
 
 public:
-    explicit UncompressedCache(size_t max_size_in_bytes, const String & uncompressed_cache_policy = "")
-        : Base(max_size_in_bytes, 0, uncompressed_cache_policy) {}
+    explicit UncompressedCache(const String & block_cache_name) : Base(block_cache_name)
+    {}
 
     /// Calculate key from path to file and offset.
     static UInt128 hash(const String & path_to_file, size_t offset)
@@ -58,25 +51,29 @@ public:
         return key;
     }
 
-    template <typename LoadFunc>
-    MappedPtr getOrSet(const Key & key, LoadFunc && load)
+    template <typename GetSizeFunc, typename InitializeFunc>
+    HolderPtr getOrSet(const Key & key, GetSizeFunc && get_size, InitializeFunc && initialize)
     {
-        auto result = Base::getOrSet(key, std::forward<LoadFunc>(load));
+        bool was_calculated = false;
+        auto result = Base::getOrSet(key, std::forward<GetSizeFunc>(get_size), std::forward<InitializeFunc>(initialize), &was_calculated);
 
-        if (result.second)
+        if (was_calculated)
             ProfileEvents::increment(ProfileEvents::UncompressedCacheMisses);
         else
             ProfileEvents::increment(ProfileEvents::UncompressedCacheHits);
 
-        return result.first;
+        return result;
     }
 
-private:
-    void onRemoveOverflowWeightLoss(size_t weight_loss) override
-    {
-        ProfileEvents::increment(ProfileEvents::UncompressedCacheWeightLost, weight_loss);
-    }
+// TODO: Add support for the ProfileEvents::UncompressedCacheWeightLost
+// private:
+//     void onRemoveOverflowWeightLoss(size_t weight_loss) override
+//     {
+//         ProfileEvents::increment(ProfileEvents::UncompressedCacheWeightLost, weight_loss);
+//     }
 };
+
+
 
 using UncompressedCachePtr = std::shared_ptr<UncompressedCache>;
 

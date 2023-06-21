@@ -19,6 +19,9 @@ namespace DB
   */
 class CachedCompressedReadBuffer : public CompressedReadBufferBase, public ReadBuffer
 {
+    using UncompressedCellHolder = PayloadHolder<UncompressedCacheCell>;
+    using UncompressedCellHolderPtr = std::shared_ptr<UncompressedCellHolder>;
+
 private:
     std::function<std::unique_ptr<ReadBufferFromFileBase>()> file_in_creator;
     UncompressedCache * cache;
@@ -30,7 +33,7 @@ private:
     size_t file_pos;
 
     /// A piece of data from the cache, or a piece of read data that we put into the cache.
-    UncompressedCache::MappedPtr owned_cell;
+    UncompressedCellHolderPtr owned_region;
 
     void initInput();
 

@@ -86,11 +86,10 @@ const MarkInCompressedFile & MergeTreeMarksLoader::getMark(size_t row_index, siz
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Column index: {} is out of range [0, {})", column_index, columns_in_mark);
 #endif
 
-    return (*marks)[row_index * columns_in_mark + column_index];
+    return (*marks).payload()[row_index * columns_in_mark + column_index];
 }
 
-
-MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
+void MergeTreeMarksLoader::readIntoMarks(MarksInCompressedFile & marks_to_load)
 {
     /// Memory for marks must not be accounted as memory usage for query, because they are stored in shared cache.
     MemoryTrackerBlockerInThread temporarily_disable_memory_tracker;
@@ -98,8 +97,6 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
     size_t file_size = data_part_storage->getFileSize(mrk_path);
     size_t mark_size = index_granularity_info.getMarkSizeInBytes(columns_in_mark);
     size_t expected_uncompressed_size = mark_size * marks_count;
-
-    auto res = std::make_shared<MarksInCompressedFile>(marks_count * columns_in_mark);
 
     if (!index_granularity_info.mark_type.compressed && expected_uncompressed_size != file_size)
         throw Exception(
@@ -118,7 +115,7 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
     if (!index_granularity_info.mark_type.adaptive)
     {
         /// Read directly to marks.
-        reader->readStrict(reinterpret_cast<char *>(res->data()), expected_uncompressed_size);
+        reader->readStrict(reinterpret_cast<char *>(marks_to_load.data()), expected_uncompressed_size);
 
         if (!reader->eof())
             throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA,
@@ -131,7 +128,7 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
         size_t granularity;
         while (!reader->eof())
         {
-            res->read(*reader, i * columns_in_mark, columns_in_mark);
+            marks_to_load.read(*reader, i * columns_in_mark, columns_in_mark);
             readIntBinary(granularity, *reader);
             ++i;
         }
@@ -140,28 +137,44 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarksImpl()
             throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Cannot read all marks from file {}", mrk_path);
     }
 
-    res->protect();
-    return res;
+    /// TODO: Implement similar functionalities
+    // res->protect();
 }
 
-MarkCache::MappedPtr MergeTreeMarksLoader::loadMarks()
+MergeTreeMarksLoader::MarksHolderPtr MergeTreeMarksLoader::loadMarksImpl()
 {
-    MarkCache::MappedPtr loaded_marks;
+    const size_t marks_size = marks_count * columns_in_mark;
+
+    auto * marks_payload = new MarksInCompressedFile(marks_size);
+    readIntoMarks(*marks_payload);
+    return std::make_shared<SharedMarksHolder>(marks_payload);
+}
+
+MergeTreeMarksLoader::MarksHolderPtr MergeTreeMarksLoader::loadMarks()
+{
+    MergeTreeMarksLoader::MarksHolderPtr loaded_marks;
+
+    const size_t marks_size = marks_count * columns_in_mark;
 
     if (mark_cache)
     {
         auto key = mark_cache->hash(fs::path(data_part_storage->getFullPath()) / mrk_path);
         if (save_marks_in_cache)
         {
-            auto callback = [this]{ return loadMarksImpl(); };
-            loaded_marks = mark_cache->getOrSet(key, callback);
+            auto get_size = [marks_size](){ return marks_size * sizeof(MarkInCompressedFile); };
+            auto initialize = [this, marks_size](void * ptr)
+            {
+                auto * data_ptr = reinterpret_cast<void *>(reinterpret_cast<char *>(ptr) + sizeof(MarksInCompressedFile));
+                auto * marks_payload = new (ptr) MarksInCompressedFile(marks_size, data_ptr);
+                readIntoMarks(*marks_payload);
+            };
+            loaded_marks = mark_cache->getOrSet(key, get_size, initialize);
         }
         else
-        {
             loaded_marks = mark_cache->get(key);
-            if (!loaded_marks)
-                loaded_marks = loadMarksImpl();
-        }
+
+        if (!loaded_marks)
+            loaded_marks = loadMarksImpl(); 
     }
     else
         loaded_marks = loadMarksImpl();
@@ -176,13 +189,13 @@ MarkCache::MappedPtr MergeTreeMarksLoader::loadMarks()
     return loaded_marks;
 }
 
-std::future<MarkCache::MappedPtr> MergeTreeMarksLoader::loadMarksAsync()
+std::future<MergeTreeMarksLoader::MarksHolderPtr> MergeTreeMarksLoader::loadMarksAsync()
 {
     ThreadGroupStatusPtr thread_group;
     if (CurrentThread::isInitialized() && CurrentThread::get().getThreadGroup())
         thread_group = CurrentThread::get().getThreadGroup();
 
-    auto task = std::make_shared<std::packaged_task<MarkCache::MappedPtr()>>([thread_group, this]
+    auto task = std::make_shared<std::packaged_task<MergeTreeMarksLoader::MarksHolderPtr()>>([thread_group, this]
     {
         setThreadName("loadMarksThread");
 

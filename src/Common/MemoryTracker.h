@@ -55,6 +55,7 @@ private:
     std::atomic<Int64> soft_limit {0};
     std::atomic<Int64> hard_limit {0};
     std::atomic<Int64> profiler_limit {0};
+    std::atomic<Int64> limit_to_purge_cache {0};
 
     static std::atomic<Int64> free_memory_in_allocator_arenas;
 
@@ -116,6 +117,7 @@ public:
 
     void setSoftLimit(Int64 value);
     void setHardLimit(Int64 value);
+    void setLimitToPurgeCache(Int64 value);
 
     Int64 getHardLimit() const
     {
@@ -124,6 +126,10 @@ public:
     Int64 getSoftLimit() const
     {
         return soft_limit.load(std::memory_order_relaxed);
+    }
+    Int64 getLimitToPurgeCache() const 
+    {
+        return limit_to_purge_cache.load(std::memory_order_relaxed);     
     }
 
     /** Set limit if it was not set.

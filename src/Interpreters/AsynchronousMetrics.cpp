@@ -11,6 +11,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/typeid_cast.h>
 #include <Common/filesystemHelpers.h>
+#include <Common/UnifiedCache.h>
 #include <Interpreters/Cache/FileCacheFactory.h>
 #include <Common/getCurrentProcessFDCount.h>
 #include <Common/getMaxFileDescriptorCount.h>
@@ -618,6 +619,69 @@ void AsynchronousMetrics::update(TimePoint update_time)
             new_values["FilesystemCacheBytes"] = cache_data->cache->getUsedCacheSize();
             new_values["FilesystemCacheFiles"] = cache_data->cache->getFileSegmentsNum();
         }
+    }
+
+    // Temporary add cache tracking
+    // TODO: Remove
+    {
+        auto & unified_cache = BlockCachesManager<UInt128>::instance();
+
+        /// Basic tracking
+        const auto unified_cache_weight = unified_cache.getCacheWeight();
+        const auto unified_cache_count = unified_cache.getCacheCount();
+        new_values["UnifiedCacheBytes"] = unified_cache_weight;
+        new_values["UnifiedCacheCount"] = unified_cache_count;
+        LOG_TRACE(log,
+            "UnifiedCacheTracking: weight is {}, count is {}",
+            ReadableSize(unified_cache_weight),
+            unified_cache_count);
+
+        /// Metrics
+        using RebalanceStrategy = IRebalanceStrategy<UInt128>;
+        using StatRequest = RebalanceStrategy::StatRequest;
+        using StatRequests = RebalanceStrategy::StatRequests;
+
+        StatRequests requests
+        {
+            StatRequest{.block_cache_name = "marks", .stat_name = "should_rebalance_to_stealing_attempts_diff"},
+            StatRequest{.block_cache_name = "uncompressed", .stat_name = "should_rebalance_to_stealing_attempts_diff"},
+            StatRequest{.block_cache_name = "marks", .stat_name = "memory_allocation_failures"},
+            StatRequest{.block_cache_name = "uncompressed", .stat_name = "memory_allocation_failures"},
+            StatRequest{.block_cache_name = "marks", .stat_name = "total_memory_blocks_size"},
+            StatRequest{.block_cache_name = "uncompressed", .stat_name = "total_memory_blocks_size"},
+        };
+        auto responses = unified_cache.getStats(requests);
+
+        LOG_TRACE(log,
+            "UnifiedCacheStats: in {} pool {} is {}",
+            requests[0].block_cache_name,
+            requests[0].stat_name,
+            responses[0].safeGet<Int64>());
+        LOG_TRACE(log,
+            "UnifiedCacheStats: in {} pool {} is {}",
+            requests[1].block_cache_name,
+            requests[1].stat_name,
+            responses[1].safeGet<Int64>());
+        LOG_TRACE(log,
+            "UnifiedCacheStats: in {} pool {} is {}",
+            requests[2].block_cache_name,
+            requests[2].stat_name,
+            responses[2].safeGet<size_t>());
+        LOG_TRACE(log,
+            "UnifiedCacheStats: in {} pool {} is {}",
+            requests[3].block_cache_name,
+            requests[3].stat_name,
+            responses[3].safeGet<size_t>());
+        LOG_TRACE(log,
+            "UnifiedCacheStats: in {} pool {} is {}",
+            requests[4].block_cache_name,
+            requests[4].stat_name,
+            responses[4].safeGet<size_t>());
+        LOG_TRACE(log,
+            "UnifiedCacheStats: in {} pool {} is {}",
+            requests[5].block_cache_name,
+            requests[5].stat_name,
+            responses[5].safeGet<size_t>());
     }
 
 #if USE_ROCKSDB
